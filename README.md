@@ -59,17 +59,34 @@ This ensures that the resulting layout is always rectangular and topologically v
 The algorithm starts with a random layout and iteratively attempts to improve it. It mimics the process of annealing in metallurgy: heating a material and slowly cooling it to remove defects.
 
 #### The Steps:
-1.  **Initialization:** Create a random binary tree and assign images to leaves randomly (respecting any user-defined locks).
-2.  **Perturbation (The "Move"):** At every step, the algorithm makes a small random change:
-    *   *Shift:* Change the split ratio `t` of a cut (move a border).
-    *   *Flip:* Change a cut from Horizontal to Vertical or vice versa.
-    *   *Swap:* Exchange the positions of two unlocked images.
-3.  **Energy Calculation:** Calculate how "bad" the new layout is (see math below).
-4.  **Acceptance Criterion:**
-    *   If the new Energy is lower (better), accept the change.
-    *   If the new Energy is higher (worse), accept it with probability **P = e^(-ΔE / T)**.
-    *   *Note:* This allows the algorithm to escape local optima by occasionally accepting bad moves early on.
-5.  **Cooling:** Decrease the Temperature **T** slightly (**T_new = T_old * 0.9994**). As **T** approaches 0, the algorithm stops accepting bad moves and settles into a final solution.
+
+**1. Initialization (The Canvas Setup)**
+The algorithm begins by generating a random binary tree structure. It recursively slices the page into smaller rectangles until there are enough "leaves" (slots) for every image.
+*   If you "locked" images in the GUI, those images are forced into specific slots.
+*   The remaining images are randomly shuffled into the remaining slots.
+*   At this stage, the layout usually looks messy: portrait images might be squeezed into wide landscape boxes.
+
+**2. Perturbation (The "Move")**
+In every single iteration (step), the algorithm attempts to modify the layout slightly. It chooses one of three random moves:
+*   **Shift:** It selects a cut line and slides it. For example, changing a 50/50 split to a 40/60 split. This changes the size of the rectangles without changing the structure.
+*   **Flip:** It rotates a cut. A vertical separator becomes a horizontal separator (or vice versa). This drastically changes the topology of the page.
+*   **Swap:** It picks two random images (that aren't locked) and swaps their positions. This helps a landscape image find a landscape slot.
+
+**3. Energy Calculation (The "Score")**
+After making a move, the algorithm calculates the "Energy" (**E**) of the new layout.
+*   **Low Energy = Good Layout.**
+*   The energy is calculated by measuring how much every image is being "hurt" by its current slot (e.g., how much cropping is required) and how uneven the sizing is.
+
+**4. Acceptance Criterion (To Move or Not to Move)**
+The algorithm decides whether to keep the change or revert it:
+*   **Better Move (Downhill):** If the new Energy is lower than the old Energy, the change is **always accepted**.
+*   **Worse Move (Uphill):** If the new Energy is higher (the layout looks worse), the change is accepted with a probability of **P = e^(-ΔE / T)**.
+    *   *Why accept a worse layout?* This allows the algorithm to escape "local minima." Sometimes you have to make a layout slightly worse temporarily to rearrange the structure enough to find the perfect solution later.
+
+**5. Cooling (The Schedule)**
+This entire process repeats thousands of times. A "Temperature" (**T**) parameter controls the chaos:
+*   **High Temperature (Start):** The algorithm accepts almost any change, even bad ones. This allows images to fly across the page and the structure to change wildly (Global Exploration).
+*   **Low Temperature (End):** As the steps progress, T decreases (**T_new = T_old * 0.9994**). The algorithm becomes strict and only accepts improvements. This "freezes" the layout into its final, polished state (Fine-tuning).
 
 ### 3. The Mathematics (Energy Function)
 The "Energy" (**E**) defines what makes a layout look good. It is calculated as:

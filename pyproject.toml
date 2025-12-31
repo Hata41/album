@@ -13,3 +13,6 @@ dependencies = [
   "tqdm",
 ]
 
+[tool.setuptools]
+py-modules = ["sa_advanced", "album_gui"]
+
