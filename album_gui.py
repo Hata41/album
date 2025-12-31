@@ -1,5 +1,6 @@
 import sys
 import os
+import random
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -17,11 +18,43 @@ from PIL import Image, ImageOps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+class ImageListEntry(QWidget):
+    def __init__(self, pixmap, filename, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 2, 5, 2)
+        
+        self.thumb = QLabel()
+        self.thumb.setPixmap(pixmap)
+        self.thumb.setFixedSize(60, 60)
+        self.thumb.setScaledContents(True)
+        # Allow clicks to pass through to the list item for selection/dragging
+        self.thumb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self.thumb)
+        
+        self.name_label = QLabel(filename)
+        self.name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self.name_label, 1)
+        
+        self.pool_cb = QCheckBox("Pool")
+        self.pool_cb.setChecked(True)
+        layout.addWidget(self.pool_cb)
+        
+        self.mandatory_cb = QCheckBox("Mandatory")
+        layout.addWidget(self.mandatory_cb)
+        
+        self.pool_cb.toggled.connect(self.on_pool_toggled)
+        
+    def on_pool_toggled(self, checked):
+        self.mandatory_cb.setEnabled(checked)
+        if not checked:
+            self.mandatory_cb.setChecked(False)
+
 class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, crop_to_fit=True):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode, crop_to_fit=True):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -33,22 +66,55 @@ class OptimizationThread(QThread):
         self.title = title
         self.pages_roots = pages_roots
         self.steps = steps
+        self.mode = mode
         self.crop_to_fit = crop_to_fit
         
     def run(self):
-        results, final_pool, energy_history = sa.anneal_global(
-            roots=self.pages_roots,
-            page_W=self.page_W,
-            page_H=self.page_H,
-            all_images=self.image_paths,
-            all_prefs=self.all_prefs,
-            initial_perms=self.chunks,
-            swap_pool=self.swap_pool,
-            locked_leaves=self.pages_locks,
-            steps=self.steps,
-            progress_callback=self.emit_progress,
-            title=self.title
-        )
+        if self.mode == "es":
+            results, final_pool, energy_history = sa.optimize_es(
+                roots=self.pages_roots,
+                page_W=self.page_W,
+                page_H=self.page_H,
+                all_images=self.image_paths,
+                all_prefs=self.all_prefs,
+                initial_perms=self.chunks,
+                swap_pool=self.swap_pool,
+                locked_leaves=self.pages_locks,
+                steps=self.steps,
+                progress_callback=self.emit_progress,
+                title=self.title
+            )
+        elif self.mode == "linear":
+            new_roots, results, final_pool, energy_history = sa.optimize_linear_partition(
+                roots=self.pages_roots,
+                page_W=self.page_W,
+                page_H=self.page_H,
+                all_images=self.image_paths,
+                all_prefs=self.all_prefs,
+                initial_perms=self.chunks,
+                swap_pool=self.swap_pool,
+                locked_leaves=self.pages_locks,
+                steps=self.steps,
+                progress_callback=self.emit_progress,
+                title=self.title
+            )
+            # Update roots in place
+            for i in range(len(self.pages_roots)):
+                self.pages_roots[i] = new_roots[i]
+        else:
+            results, final_pool, energy_history = sa.anneal_global(
+                roots=self.pages_roots,
+                page_W=self.page_W,
+                page_H=self.page_H,
+                all_images=self.image_paths,
+                all_prefs=self.all_prefs,
+                initial_perms=self.chunks,
+                swap_pool=self.swap_pool,
+                locked_leaves=self.pages_locks,
+                steps=self.steps,
+                progress_callback=self.emit_progress,
+                title=self.title
+            )
         self.finished_optim.emit(results, energy_history)
         
     def emit_progress(self, step, total):
@@ -141,6 +207,8 @@ class AlbumWindow(QMainWindow):
         
         # State
         self.image_paths: List[Path] = []
+        self.current_folder: Optional[Path] = None
+        self.image_metadata: List[sa.ImageMetadata] = []
         self.pages_roots: List[Optional[sa.Node]] = []
         self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
         self.pages_locks: List[Dict[int, int]] = [] # Each is leaf_id -> image_idx
@@ -213,6 +281,16 @@ class AlbumWindow(QMainWindow):
         title_row.addWidget(title_label)
         title_row.addWidget(self.title_edit)
         right_layout.addLayout(title_row)
+
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("Optimization Algorithm")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Simulated Annealing", "sa")
+        self.mode_combo.addItem("Evolutionary Strategy", "es")
+        self.mode_combo.addItem("Linear Partitioning (Instant)", "linear")
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.mode_combo)
+        right_layout.addLayout(mode_row)
 
         steps_row = QHBoxLayout()
         steps_label = QLabel("Annealing Steps")
@@ -297,6 +375,8 @@ class AlbumWindow(QMainWindow):
 
     def load_images(self, folder):
         self.image_paths = []
+        self.current_folder = Path(folder)
+        self.image_metadata = []
         self.all_prefs = []
         self.pages_roots = []
         self.pages_perms = []
@@ -317,20 +397,21 @@ class AlbumWindow(QMainWindow):
             return
 
         self.image_paths = files
-        self.all_prefs = [sa.pref_aspect_for(p) for p in self.image_paths]
+        
+        # Task 2: Image Metadata Caching
+        self.image_metadata = sa.batch_process_images(self.image_paths)
+        self.all_prefs = [m.pref_aspect for m in self.image_metadata]
+        
         self.update_slot_selector(len(self.image_paths))
         
         for idx, p in enumerate(self.image_paths):
-            # Load thumbnail
-            item = QListWidgetItem()
-            # Efficient thumbnail loading?
-            pix = QPixmap(str(p)).scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            item.setIcon(QIcon(pix))
-            item.setData(Qt.ItemDataRole.UserRole, idx) # Store index
-            item.setText(p.name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
-            self.image_list.addItem(item)
+            item = QListWidgetItem(self.image_list)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            item.setSizeHint(QSize(200, 70))
+            
+            pix = QPixmap(str(p)).scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            widget = ImageListEntry(pix, p.name)
+            self.image_list.setItemWidget(item, widget)
             
         self.init_trees()
         self.optimize_btn.setEnabled(bool(self.pages_roots))
@@ -411,7 +492,6 @@ class AlbumWindow(QMainWindow):
             self.optimize_btn.setEnabled(False)
             return
 
-        import random
         pool_indices = list(range(total_images))
         random.shuffle(pool_indices)
         self.pages_perms = [pool_indices[i*leaf_count:(i+1)*leaf_count] for i in range(num_pages)]
@@ -566,42 +646,74 @@ class AlbumWindow(QMainWindow):
         slots_per_page = self.target_leaf_count
         total_needed = num_pages * slots_per_page
 
-        active_indices = []
+        # Relaunch: Regenerate trees to avoid local minima, preserving locks
+        self.pages_roots = [sa.build_full_tree(slots_per_page, seed=random.randint(0, 1000000)) for _ in range(num_pages)]
+
+        # Step A: Identify locked indices (implicitly mandatory)
+        locked_indices = set()
+        for p_locks in self.pages_locks:
+            for img_idx in p_locks.values():
+                locked_indices.add(img_idx)
+
+        # Step B: Gather mandatory and optional images from the list
+        mandatory_indices = set(locked_indices)
+        optional_indices = []
+
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
+            widget = self.image_list.itemWidget(item)
+            if isinstance(widget, ImageListEntry):
                 idx = item.data(Qt.ItemDataRole.UserRole)
-                active_indices.append(idx)
+                if widget.mandatory_cb.isChecked():
+                    mandatory_indices.add(idx)
+                elif widget.pool_cb.isChecked() and idx not in locked_indices:
+                    optional_indices.append(idx)
 
-        if len(active_indices) < total_needed:
-            QMessageBox.warning(self, "Not Enough Images", f"You need at least {total_needed} images for {num_pages} pages with {slots_per_page} slots each, but only {len(active_indices)} are selected.")
+        # Step C: Validation
+        if len(mandatory_indices) > total_needed:
+            QMessageBox.warning(self, "Too Many Mandatory Images", 
+                                f"You have {len(mandatory_indices)} mandatory images (including locked ones) but only {total_needed} slots available.")
             return
+
+        if len(mandatory_indices) + len(optional_indices) < total_needed:
+            QMessageBox.warning(self, "Not Enough Images", 
+                                f"You need {total_needed} images, but only {len(mandatory_indices) + len(optional_indices)} are available in the pool.")
+            return
+
+        # Step D: Selection
+        # Start with mandatory images
+        active_indices = list(mandatory_indices)
+        # Fill the rest with optional images (sequential selection)
+        slots_remaining = total_needed - len(active_indices)
+        if slots_remaining > 0:
+            active_indices.extend(optional_indices[:slots_remaining])
 
         # Initialize buckets
         chunks = [[] for _ in range(num_pages)]
         assigned = set()
 
-        # Identify and assign locked images
+        # Identify and assign locked images to their specific pages
         for p in range(num_pages):
             for leaf_id, img_idx in self.pages_locks[p].items():
-                if img_idx in active_indices and img_idx not in assigned:
+                if img_idx in active_indices:
                     chunks[p].append(img_idx)
                     assigned.add(img_idx)
 
-        # Distribute remaining images
-        free_images = [idx for idx in active_indices if idx not in assigned]
+        # Distribute remaining active images into chunks
+        free_active = [idx for idx in active_indices if idx not in assigned]
         for p in range(num_pages):
-            while len(chunks[p]) < slots_per_page and free_images:
-                chunks[p].append(free_images.pop(0))
+            while len(chunks[p]) < slots_per_page and free_active:
+                chunks[p].append(free_active.pop(0))
 
-        # Create swap pool
-        swap_pool = free_images
+        # Create swap pool from any remaining optional images not in active_indices
+        swap_pool = optional_indices[slots_remaining:]
 
         # Prepare for thread
         title = self.title_edit.text()
         steps = self.steps_spin.value()
+        mode = self.mode_combo.currentData()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps,
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode,
             crop_to_fit=self.crop_checkbox.isChecked()
         )
         self.worker.progress.connect(self.progress_bar.setValue)
@@ -617,7 +729,6 @@ class AlbumWindow(QMainWindow):
         self.optimize_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
         self.update_energy_plot(energy_history)
-        QMessageBox.information(self, "Done", "Optimization Complete!")
 
     def update_energy_plot(self, history):
         if self.canvas is None:
@@ -636,27 +747,37 @@ class AlbumWindow(QMainWindow):
         self.canvas.draw()
 
     def export_pdf_dialog(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Album as PDF", "", "PDF Files (*.pdf)")
-        if path:
-            self.export_btn.setEnabled(False)
-            self.optimize_btn.setEnabled(False)
-            self.progress_bar.setValue(0)
+        if not self.current_folder:
+            return
             
-            title = self.title_edit.text()
-            self.export_worker = ExportThread(
-                path, self.pages_roots, self.pages_perms, self.image_paths, title,
-                crop_to_fit=self.crop_checkbox.isChecked()
-            )
-            self.export_worker.progress.connect(self.progress_bar.setValue)
-            self.export_worker.finished.connect(self.on_export_finished)
-            self.export_worker.start()
+        pdf_dir = Path("pdfs")
+        pdf_dir.mkdir(exist_ok=True)
+        
+        base_name = self.current_folder.name
+        i = 1
+        while True:
+            path = pdf_dir / f"{base_name}_{i}.pdf"
+            if not path.exists():
+                break
+            i += 1
+            
+        self.export_btn.setEnabled(False)
+        self.optimize_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        
+        title = self.title_edit.text()
+        self.export_worker = ExportThread(
+            str(path), self.pages_roots, self.pages_perms, self.image_paths, title,
+            crop_to_fit=self.crop_checkbox.isChecked()
+        )
+        self.export_worker.progress.connect(self.progress_bar.setValue)
+        self.export_worker.finished.connect(self.on_export_finished)
+        self.export_worker.start()
 
     def on_export_finished(self, success, message):
         self.export_btn.setEnabled(True)
         self.optimize_btn.setEnabled(True)
-        if success:
-            QMessageBox.information(self, "Export Success", message)
-        else:
+        if not success:
             QMessageBox.critical(self, "Export Failed", message)
 
     def reset_layout(self):
@@ -703,11 +824,17 @@ class AlbumWindow(QMainWindow):
 
     def select_all_images(self):
         for i in range(self.image_list.count()):
-            self.image_list.item(i).setCheckState(Qt.CheckState.Checked)
+            item = self.image_list.item(i)
+            widget = self.image_list.itemWidget(item)
+            if isinstance(widget, ImageListEntry):
+                widget.pool_cb.setChecked(True)
 
     def select_none_images(self):
         for i in range(self.image_list.count()):
-            self.image_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+            item = self.image_list.item(i)
+            widget = self.image_list.itemWidget(item)
+            if isinstance(widget, ImageListEntry):
+                widget.pool_cb.setChecked(False)
 
 # Custom Drag for ListWidget
 # We need to subclass QListWidget to support custom mime data easily, 
