@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QGraphicsTextItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox)
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox, QMenu)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, QTextDocument
 
@@ -54,7 +54,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode, crop_to_fit=True):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -67,7 +67,6 @@ class OptimizationThread(QThread):
         self.pages_roots = pages_roots
         self.steps = steps
         self.mode = mode
-        self.crop_to_fit = crop_to_fit
         
     def run(self):
         if self.mode == "es":
@@ -124,14 +123,14 @@ class ExportThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, crop_to_fit=True):
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, image_crop_states):
         super().__init__()
         self.output_path = output_path
         self.pages_roots = pages_roots
         self.pages_perms = pages_perms
         self.image_paths = image_paths
         self.title = title
-        self.crop_to_fit = crop_to_fit
+        self.image_crop_states = image_crop_states
         self.export_W = 2480
         self.export_H = 3508
         
@@ -152,7 +151,7 @@ class ExportThread(QThread):
                     page_margin_px=120,
                     gap_px=40,
                     title=self.title,
-                    crop_to_fit=self.crop_to_fit
+                    crop_states=self.image_crop_states
                 )
                 pdf_pages.append(page_img)
                 self.progress.emit(i + 1, total)
@@ -184,6 +183,24 @@ class LeafItem(QGraphicsRectItem):
         # Lock icon (simple red border or overlay for now)
         self.is_locked = False
         
+    def contextMenuEvent(self, event):
+        if self.page_idx >= len(self.parent_gui.pages_perms):
+            return
+        perm = self.parent_gui.pages_perms[self.page_idx]
+        if self.leaf_id >= len(perm):
+            return
+        img_idx = perm[self.leaf_id]
+        
+        menu = QMenu()
+        is_cropped = self.parent_gui.image_crop_states.get(img_idx, True)
+        
+        action_text = "Fit Entire Image" if is_cropped else "Crop to Fill"
+        toggle_action = menu.addAction(action_text)
+        
+        action = menu.exec(event.screenPos())
+        if action == toggle_action:
+            self.parent_gui.toggle_crop_state(img_idx)
+
     def paint(self, painter, option, widget):
         super().paint(painter, option, widget)
         if self.is_locked:
@@ -209,6 +226,7 @@ class AlbumWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.current_folder: Optional[Path] = None
         self.image_metadata: List[sa.ImageMetadata] = []
+        self.image_crop_states: Dict[int, bool] = {} # img_idx -> bool (True=Crop, False=Fit)
         self.pages_roots: List[Optional[sa.Node]] = []
         self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
         self.pages_locks: List[Dict[int, int]] = [] # Each is leaf_id -> image_idx
@@ -303,11 +321,6 @@ class AlbumWindow(QMainWindow):
         steps_row.addWidget(self.steps_spin)
         right_layout.addLayout(steps_row)
 
-        self.crop_checkbox = QCheckBox("Crop Images to Fill Slots")
-        self.crop_checkbox.setChecked(True)
-        self.crop_checkbox.stateChanged.connect(self.draw_layout)
-        right_layout.addWidget(self.crop_checkbox)
-
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
         self.optimize_btn.setEnabled(False)
@@ -316,12 +329,21 @@ class AlbumWindow(QMainWindow):
         self.export_btn = QPushButton("Save as PDF")
         self.export_btn.clicked.connect(self.export_pdf_dialog)
         self.export_btn.setEnabled(False)
+
+        crop_row = QHBoxLayout()
+        self.crop_all_btn = QPushButton("Crop All")
+        self.crop_all_btn.clicked.connect(self.crop_all)
+        self.uncrop_all_btn = QPushButton("Uncrop All")
+        self.uncrop_all_btn.clicked.connect(self.uncrop_all)
+        crop_row.addWidget(self.crop_all_btn)
+        crop_row.addWidget(self.uncrop_all_btn)
         
         self.progress_bar = QProgressBar()
         
         right_layout.addWidget(self.optimize_btn)
         right_layout.addWidget(self.reset_btn)
         right_layout.addWidget(self.export_btn)
+        right_layout.addLayout(crop_row)
         right_layout.addStretch()
 
         # Plot Placeholder
@@ -589,7 +611,8 @@ class AlbumWindow(QMainWindow):
             path = self.image_paths[img_idx]
             pix = QPixmap(str(path))
             if not pix.isNull():
-                 if self.crop_checkbox.isChecked():
+                 should_crop = self.image_crop_states.get(img_idx, True)
+                 if should_crop:
                     scaled = pix.scaled(int(w-gap), int(h-gap), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
                     copy = scaled.copy(
                         (scaled.width() - int(w-gap)) // 2,
@@ -636,6 +659,21 @@ class AlbumWindow(QMainWindow):
         else:
             perm[leaf_id] = img_idx
 
+        self.draw_layout()
+
+    def toggle_crop_state(self, img_idx):
+        current = self.image_crop_states.get(img_idx, True)
+        self.image_crop_states[img_idx] = not current
+        self.draw_layout()
+
+    def crop_all(self):
+        for i in range(len(self.image_paths)):
+            self.image_crop_states[i] = True
+        self.draw_layout()
+
+    def uncrop_all(self):
+        for i in range(len(self.image_paths)):
+            self.image_crop_states[i] = False
         self.draw_layout()
 
     def start_optimization(self):
@@ -713,8 +751,7 @@ class AlbumWindow(QMainWindow):
         steps = self.steps_spin.value()
         mode = self.mode_combo.currentData()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode,
-            crop_to_fit=self.crop_checkbox.isChecked()
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)
@@ -767,8 +804,7 @@ class AlbumWindow(QMainWindow):
         
         title = self.title_edit.text()
         self.export_worker = ExportThread(
-            str(path), self.pages_roots, self.pages_perms, self.image_paths, title,
-            crop_to_fit=self.crop_checkbox.isChecked()
+            str(path), self.pages_roots, self.pages_perms, self.image_paths, title, self.image_crop_states
         )
         self.export_worker.progress.connect(self.progress_bar.setValue)
         self.export_worker.finished.connect(self.on_export_finished)

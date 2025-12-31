@@ -178,7 +178,7 @@ def render_page(
     gap_px: int,
     bg=(255, 255, 255),
     title: str = "default title",
-    crop_to_fit: bool = True,
+    crop_states: Optional[Dict[int, bool]] = None,
 ) -> Image.Image:
     title_height = int(page_H * 0.1)
     inner_W = page_W - 2 * page_margin_px
@@ -221,7 +221,11 @@ def render_page(
         img_id = perm[leaf_id]
         with Image.open(images[img_id]) as im:
             im = im.convert("RGB")
-            if crop_to_fit:
+            should_crop = True
+            if crop_states is not None:
+                should_crop = crop_states.get(img_id, True)
+                
+            if should_crop:
                 tile = ImageOps.fit(im, (wi, hi), method=Image.Resampling.LANCZOS)
             else:
                 tile = ImageOps.pad(im, (wi, hi), color=bg, centering=(0.5, 0.5))
