@@ -18,7 +18,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list)
     
-    def __init__(self, root, page_W, page_H, images, all_prefs, locked_leaves):
+    def __init__(self, root, page_W, page_H, images, all_prefs, locked_leaves, subset_to_global):
         super().__init__()
         self.root = root
         self.page_W = page_W
@@ -26,6 +26,7 @@ class OptimizationThread(QThread):
         self.images = images
         self.all_prefs = all_prefs
         self.locked_leaves = locked_leaves
+        self.subset_to_global = subset_to_global
         
     def run(self):
         # We don't need snapshots for the optimization run itself unless we want to display them
@@ -46,7 +47,8 @@ class OptimizationThread(QThread):
             locked_leaves=self.locked_leaves,
             progress_callback=self.emit_progress
         )
-        self.finished_optim.emit(perm)
+        global_perm = [self.subset_to_global[subset_idx] for subset_idx in perm]
+        self.finished_optim.emit(global_perm)
         
     def emit_progress(self, step, total):
         self.progress.emit(step, total)
@@ -110,6 +112,15 @@ class AlbumWindow(QMainWindow):
         self.load_btn = QPushButton("Load Folder")
         self.load_btn.clicked.connect(self.load_images_dialog)
         left_layout.addWidget(self.load_btn)
+        
+        select_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self.select_all_images)
+        self.select_none_btn = QPushButton("Select None")
+        self.select_none_btn.clicked.connect(self.select_none_images)
+        select_layout.addWidget(self.select_all_btn)
+        select_layout.addWidget(self.select_none_btn)
+        left_layout.addLayout(select_layout)
         
         self.image_list = QListWidget()
         self.image_list.setIconSize(QSize(100, 100))
@@ -196,6 +207,8 @@ class AlbumWindow(QMainWindow):
             item.setIcon(QIcon(pix))
             item.setData(Qt.ItemDataRole.UserRole, idx) # Store index
             item.setText(p.name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
             self.image_list.addItem(item)
             
         self.init_tree()
@@ -359,18 +372,36 @@ class AlbumWindow(QMainWindow):
         if not self.root or not self.perm:
             return
 
-        if not self.all_prefs or len(self.all_prefs) != len(self.image_paths):
-            self.all_prefs = [sa.pref_aspect_for(p) for p in self.image_paths]
+        active_indices = []
+        for i in range(self.image_list.count()):
+            item = self.image_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                active_indices.append(idx)
 
-        locked = {
-            leaf_id: img_idx
-            for leaf_id, img_idx in self.locked_leaves.items()
-            if 0 <= leaf_id < len(self.perm)
-        }
+        if not active_indices:
+            QMessageBox.warning(self, "No Images", "Please select at least one image.")
+            return
+
+        active_count = len(active_indices)
+        if active_count < self.target_leaf_count:
+            self.target_leaf_count = sa.largest_power_of_two_leq(active_count)
+            self.init_tree()  # rebuild tree with new count
+
+        active_paths = [self.image_paths[idx] for idx in active_indices]
+        active_prefs = [self.all_prefs[idx] for idx in active_indices]
+        subset_to_global = {i: idx for i, idx in enumerate(active_indices)}
+
+        # Filter and remap locked_leaves
+        new_locked = {}
+        for leaf_id, img_idx in self.locked_leaves.items():
+            if img_idx in active_indices:
+                subset_idx = active_indices.index(img_idx)
+                new_locked[leaf_id] = subset_idx
 
         self.worker = OptimizationThread(
             self.root, self.page_W, self.page_H,
-            self.image_paths, self.all_prefs, locked
+            active_paths, active_prefs, new_locked, subset_to_global
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)
@@ -387,6 +418,14 @@ class AlbumWindow(QMainWindow):
     def reset_layout(self):
         self.locked_leaves = {}
         self.init_tree() # Re-randomize
+
+    def select_all_images(self):
+        for i in range(self.image_list.count()):
+            self.image_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def select_none_images(self):
+        for i in range(self.image_list.count()):
+            self.image_list.item(i).setCheckState(Qt.CheckState.Unchecked)
 
 # Custom Drag for ListWidget
 # We need to subclass QListWidget to support custom mime data easily, 
