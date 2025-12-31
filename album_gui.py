@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox)
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon
 
@@ -18,37 +18,56 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list)
     
-    def __init__(self, root, page_W, page_H, images, all_prefs, locked_leaves, subset_to_global):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H):
         super().__init__()
-        self.root = root
+        self.chunks = chunks
+        self.swap_pool = swap_pool.copy()
+        self.pages_locks = pages_locks
+        self.all_prefs = all_prefs
+        self.image_paths = image_paths
         self.page_W = page_W
         self.page_H = page_H
-        self.images = images
-        self.all_prefs = all_prefs
-        self.locked_leaves = locked_leaves
-        self.subset_to_global = subset_to_global
         
     def run(self):
-        # We don't need snapshots for the optimization run itself unless we want to display them
-        # Let's just run it.
-        perm, _ = sa.anneal_with_snapshots(
-            root=self.root,
-            page_W=self.page_W,
-            page_H=self.page_H,
-            all_images=self.images,
-            all_prefs=self.all_prefs,
-            page_margin_px=50, # Scaled down for GUI? Or full size? 
-                          # Ideally we use full size logic but simple coordinates.
-            gap_px=20,
-            steps=5000, # Faster for interactive
-            snapshots_count=0,
-            seed=42, # Make random?
-            desc="Optimizing",
-            locked_leaves=self.locked_leaves,
-            progress_callback=self.emit_progress
-        )
-        global_perm = [self.subset_to_global[subset_idx] for subset_idx in perm]
-        self.finished_optim.emit(global_perm)
+        results = []
+        for page_idx, chunk in enumerate(self.chunks):
+            current_all_images = [self.image_paths[i] for i in chunk + self.swap_pool]
+            current_all_prefs = [self.all_prefs[i] for i in chunk + self.swap_pool]
+            
+            # Map locked to local indices
+            locked = {}
+            for leaf_id, global_img_idx in self.pages_locks[page_idx].items():
+                if global_img_idx in chunk + self.swap_pool:
+                    local_idx = (chunk + self.swap_pool).index(global_img_idx)
+                    locked[leaf_id] = local_idx
+            
+            root = sa.build_full_tree(len(chunk), seed=42 + page_idx)
+            
+            perm, _ = sa.anneal_with_snapshots(
+                root=root,
+                page_W=self.page_W,
+                page_H=self.page_H,
+                all_images=current_all_images,
+                all_prefs=current_all_prefs,
+                page_margin_px=50,
+                gap_px=20,
+                steps=5000,
+                snapshots_count=0,
+                seed=42 + page_idx,
+                desc=f"Optimizing Page {page_idx + 1}",
+                locked_leaves=locked,
+                progress_callback=self.emit_progress
+            )
+            # perm is local indices, map back to global indices
+            local_to_global = chunk + self.swap_pool
+            global_perm = [local_to_global[local_idx] for local_idx in perm]
+            results.append(global_perm)
+            
+            # Remove used images from swap_pool
+            used = set(global_perm)
+            self.swap_pool = [img for img in self.swap_pool if img not in used]
+        
+        self.finished_optim.emit(results)
         
     def emit_progress(self, step, total):
         self.progress.emit(step, total)
@@ -91,11 +110,12 @@ class AlbumWindow(QMainWindow):
         
         # State
         self.image_paths: List[Path] = []
-        self.root: Optional[sa.Node] = None
-        self.perm: List[int] = [] # Maps leaf_id -> image_idx
-        self.locked_leaves: Dict[int, int] = {} # leaf_id -> image_idx
+        self.pages_roots: List[Optional[sa.Node]] = []
+        self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
+        self.pages_locks: List[Dict[int, int]] = {} # Each is leaf_id -> image_idx
         self.target_leaf_count: Optional[int] = None
         self.all_prefs: List[float] = []
+        self.current_page_idx = 0
         
         self.page_W = 1000  # Internal logic size
         self.page_H = 1414  # ~A4 Aspect
@@ -105,7 +125,7 @@ class AlbumWindow(QMainWindow):
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        layout = QHBoxLayout(main_widget)
+        main_layout = QVBoxLayout(main_widget)
         
         # Left: Images
         left_layout = QVBoxLayout()
@@ -135,13 +155,23 @@ class AlbumWindow(QMainWindow):
         
         # Right: Controls
         right_layout = QVBoxLayout()
+        num_pages_row = QHBoxLayout()
+        num_pages_label = QLabel("Number of Pages")
+        self.num_pages_spin = QSpinBox()
+        self.num_pages_spin.setMinimum(1)
+        self.num_pages_spin.setValue(1)
+        num_pages_row.addWidget(num_pages_label)
+        num_pages_row.addWidget(self.num_pages_spin)
+        right_layout.addLayout(num_pages_row)
+        
         size_row = QHBoxLayout()
-        size_label = QLabel("Target slots")
+        size_label = QLabel("Slots per Page")
         self.slot_combo = QComboBox()
         self.slot_combo.setEnabled(False)
         self.slot_combo.currentIndexChanged.connect(self.on_slot_count_changed)
         size_row.addWidget(size_label)
         size_row.addWidget(self.slot_combo)
+        right_layout.addLayout(size_row)
 
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
@@ -168,7 +198,21 @@ class AlbumWindow(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(1, 2)
         
-        layout.addWidget(splitter)
+        main_layout.addWidget(splitter)
+        
+        # Bottom: Navigation
+        bottom_layout = QHBoxLayout()
+        self.prev_btn = QPushButton("Previous Page")
+        self.prev_btn.clicked.connect(self.prev_page)
+        self.page_label = QLabel("Page 1 / 1")
+        self.next_btn = QPushButton("Next Page")
+        self.next_btn.clicked.connect(self.next_page)
+        bottom_layout.addWidget(self.prev_btn)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.page_label)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.next_btn)
+        main_layout.addLayout(bottom_layout)
 
     def load_images_dialog(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
@@ -178,9 +222,9 @@ class AlbumWindow(QMainWindow):
     def load_images(self, folder):
         self.image_paths = []
         self.all_prefs = []
-        self.root = None
-        self.perm = []
-        self.locked_leaves = {}
+        self.pages_roots = []
+        self.pages_perms = []
+        self.pages_locks = []
         self.target_leaf_count = None
         self.image_list.clear()
         
@@ -212,8 +256,8 @@ class AlbumWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             self.image_list.addItem(item)
             
-        self.init_tree()
-        self.optimize_btn.setEnabled(self.root is not None)
+        self.init_trees()
+        self.optimize_btn.setEnabled(bool(self.pages_roots))
 
     def update_slot_selector(self, total_images: int):
         if total_images <= 0:
@@ -250,10 +294,9 @@ class AlbumWindow(QMainWindow):
             return
         self.target_leaf_count = count
         # Changing the slot count invalidates previous locks.
-        self.locked_leaves = {}
-        self.init_tree()
+        self.init_trees()
 
-    def init_tree(self):
+    def init_trees(self):
         total_images = len(self.image_paths)
         if total_images == 0:
             self.optimize_btn.setEnabled(False)
@@ -273,32 +316,40 @@ class AlbumWindow(QMainWindow):
                 self.slot_combo.blockSignals(False)
 
         leaf_count = self.target_leaf_count
+        num_pages = self.num_pages_spin.value()
         try:
-            self.root = sa.build_full_tree(leaf_count, seed=42)
+            self.pages_roots = [sa.build_full_tree(leaf_count, seed=42 + i) for i in range(num_pages)]
         except AssertionError:
-            self.root = None
+            self.pages_roots = []
             self.optimize_btn.setEnabled(False)
             return
 
         import random
         pool_indices = list(range(total_images))
         random.shuffle(pool_indices)
-        self.perm = pool_indices[:leaf_count]
-        self.locked_leaves = {}
+        self.pages_perms = [pool_indices[i*leaf_count:(i+1)*leaf_count] for i in range(num_pages)]
+        self.pages_locks = [{} for _ in range(num_pages)]
         
+        self.current_page_idx = 0
+        self.update_page_nav()
         self.draw_layout()
-        self.optimize_btn.setEnabled(self.root is not None)
+        self.optimize_btn.setEnabled(bool(self.pages_roots))
 
     def draw_layout(self):
         self.scene.clear()
-        if not self.root or not self.perm: return
+        if not self.pages_roots or self.current_page_idx >= len(self.pages_roots) or not self.pages_perms[self.current_page_idx]:
+            return
+        
+        root = self.pages_roots[self.current_page_idx]
+        perm = self.pages_perms[self.current_page_idx]
+        locked = self.pages_locks[self.current_page_idx]
         
         margin = 20
         W, H = self.page_W, self.page_H
         in_W = W - 2*margin
         in_H = H - 2*margin
         
-        boxes = sa.decode_region(self.root, margin, margin, in_W, in_H)
+        boxes = sa.decode_region(root, margin, margin, in_W, in_H)
         
         gap = 10
         
@@ -310,9 +361,9 @@ class AlbumWindow(QMainWindow):
             )
             rect_item.setPos(x + gap/2, y + gap/2)
             
-            if leaf_id >= len(self.perm):
+            if leaf_id >= len(perm):
                 continue
-            img_idx = self.perm[leaf_id]
+            img_idx = perm[leaf_id]
             if img_idx < 0 or img_idx >= len(self.image_paths):
                 continue
             
@@ -333,7 +384,7 @@ class AlbumWindow(QMainWindow):
                  )
                  rect_item.pixmap_item.setPixmap(copy)
             
-            if leaf_id in self.locked_leaves:
+            if leaf_id in locked:
                 rect_item.is_locked = True
                 
             self.scene.addItem(rect_item)
@@ -343,35 +394,41 @@ class AlbumWindow(QMainWindow):
     def handle_drop(self, leaf_id, img_idx):
         # User dropped image `img_idx` onto `leaf_id`.
         # Constraint: Image `img_idx` MUST be at `leaf_id`.
-        if not self.root or not self.perm:
+        if not self.pages_roots or self.current_page_idx >= len(self.pages_roots) or not self.pages_perms[self.current_page_idx]:
             return
-        if leaf_id < 0 or leaf_id >= len(self.perm):
+        perm = self.pages_perms[self.current_page_idx]
+        locked = self.pages_locks[self.current_page_idx]
+        if leaf_id < 0 or leaf_id >= len(perm):
             return
         if img_idx < 0 or img_idx >= len(self.image_paths):
             return
 
         # Remove any previous lock that tied this image to a different leaf.
-        for locked_leaf, locked_img in list(self.locked_leaves.items()):
+        for locked_leaf, locked_img in list(locked.items()):
             if locked_leaf != leaf_id and locked_img == img_idx:
-                del self.locked_leaves[locked_leaf]
+                del locked[locked_leaf]
 
-        self.locked_leaves[leaf_id] = img_idx
+        locked[leaf_id] = img_idx
 
-        if img_idx in self.perm:
-            current_leaf_of_img = self.perm.index(img_idx)
+        if img_idx in perm:
+            current_leaf_of_img = perm.index(img_idx)
             if current_leaf_of_img != leaf_id:
-                self.perm[leaf_id], self.perm[current_leaf_of_img] = (
-                    self.perm[current_leaf_of_img],
-                    self.perm[leaf_id],
+                perm[leaf_id], perm[current_leaf_of_img] = (
+                    perm[current_leaf_of_img],
+                    perm[leaf_id],
                 )
         else:
-            self.perm[leaf_id] = img_idx
+            perm[leaf_id] = img_idx
 
         self.draw_layout()
 
     def start_optimization(self):
-        if not self.root or not self.perm:
+        if not self.pages_roots or not self.pages_perms:
             return
+
+        num_pages = self.num_pages_spin.value()
+        slots_per_page = self.target_leaf_count
+        total_needed = num_pages * slots_per_page
 
         active_indices = []
         for i in range(self.image_list.count()):
@@ -380,45 +437,58 @@ class AlbumWindow(QMainWindow):
                 idx = item.data(Qt.ItemDataRole.UserRole)
                 active_indices.append(idx)
 
-        if not active_indices:
-            QMessageBox.warning(self, "No Images", "Please select at least one image.")
+        if len(active_indices) < total_needed:
+            QMessageBox.warning(self, "Not Enough Images", f"You need at least {total_needed} images for {num_pages} pages with {slots_per_page} slots each, but only {len(active_indices)} are selected.")
             return
 
-        active_count = len(active_indices)
-        if active_count < self.target_leaf_count:
-            self.target_leaf_count = sa.largest_power_of_two_leq(active_count)
-            self.init_tree()  # rebuild tree with new count
+        # Slice into chunks
+        chunks = [active_indices[i*slots_per_page:(i+1)*slots_per_page] for i in range(num_pages)]
+        swap_pool = active_indices[total_needed:]
 
-        active_paths = [self.image_paths[idx] for idx in active_indices]
-        active_prefs = [self.all_prefs[idx] for idx in active_indices]
-        subset_to_global = {i: idx for i, idx in enumerate(active_indices)}
-
-        # Filter and remap locked_leaves
-        new_locked = {}
-        for leaf_id, img_idx in self.locked_leaves.items():
-            if img_idx in active_indices:
-                subset_idx = active_indices.index(img_idx)
-                new_locked[leaf_id] = subset_idx
-
+        # Prepare for thread
         self.worker = OptimizationThread(
-            self.root, self.page_W, self.page_H,
-            active_paths, active_prefs, new_locked, subset_to_global
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H
         )
         self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.finished_optim.connect(self.on_optim_finished)
+        self.worker.finished_optim.connect(self.finished_optimization)
         
         self.optimize_btn.setEnabled(False)
         self.worker.start()
 
-    def on_optim_finished(self, perm):
-        self.perm = perm
+    def finished_optimization(self, results):
+        self.pages_perms = results
+        self.update_page_nav()
         self.draw_layout()
         self.optimize_btn.setEnabled(True)
         QMessageBox.information(self, "Done", "Optimization Complete!")
 
     def reset_layout(self):
-        self.locked_leaves = {}
-        self.init_tree() # Re-randomize
+        for locks in self.pages_locks:
+            locks.clear()
+        self.init_trees() # Re-randomize
+
+    def prev_page(self):
+        if self.current_page_idx > 0:
+            self.current_page_idx -= 1
+            self.update_page_nav()
+            self.draw_layout()
+
+    def next_page(self):
+        if self.current_page_idx < len(self.pages_roots) - 1:
+            self.current_page_idx += 1
+            self.update_page_nav()
+            self.draw_layout()
+
+    def update_page_nav(self):
+        num_pages = len(self.pages_roots)
+        if num_pages == 0:
+            self.page_label.setText("Page 0 / 0")
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+        else:
+            self.page_label.setText(f"Page {self.current_page_idx + 1} / {num_pages}")
+            self.prev_btn.setEnabled(self.current_page_idx > 0)
+            self.next_btn.setEnabled(self.current_page_idx < num_pages - 1)
 
     def select_all_images(self):
         for i in range(self.image_list.count()):
