@@ -181,6 +181,7 @@ class AlbumWindow(QMainWindow):
         self.root = None
         self.perm = []
         self.locked_leaves = {}
+        self.target_leaf_count = None
         self.image_list.clear()
         
         folder_path = Path(folder)

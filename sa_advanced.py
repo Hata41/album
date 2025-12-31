@@ -147,7 +147,7 @@ def render_page(
 
         img_id = perm[leaf_id]
         with Image.open(images[img_id]) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = im.convert("RGB")
             tile = ImageOps.fit(im, (wi, hi), method=Image.Resampling.LANCZOS)
             page.paste(tile, (xi, yi))
 
