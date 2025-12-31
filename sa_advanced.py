@@ -251,8 +251,10 @@ def anneal_with_snapshots(
 
     E = energy(root, inner_W, inner_H, perm, all_prefs)
     T = 1.5
+    energy_history = []
 
     for step in tqdm(range(steps), desc=desc, leave=False):
+        energy_history.append(E)
         if progress_callback:
             progress_callback(step, steps)
 
@@ -327,11 +329,8 @@ def anneal_with_snapshots(
             page_margin_px, gap_px, title=title
         ))
 
-    return perm, snapshots
+    return perm, snapshots, energy_history
 
-# =============================
-# Global Multi-Page Annealing
-# =============================
 def anneal_global(
     roots: List[Node],
     page_W: int, page_H: int,
@@ -342,7 +341,7 @@ def anneal_global(
     steps: int = 10000,
     progress_callback: Optional[callable] = None,
     title: str = "default title"
-) -> Tuple[List[List[int]], List[int]]:
+) -> Tuple[List[List[int]], List[int], List[float]]:
     rng = random.Random(42)
     num_pages = len(roots)
     perms = [p[:] for p in initial_perms]
@@ -368,8 +367,10 @@ def anneal_global(
     page_energies = [energy(roots[p], inner_W, inner_H, perms[p], all_prefs) for p in range(num_pages)]
     E = sum(page_energies)
     T = 1.5
+    energy_history = []
 
     for step in tqdm(range(steps), desc="Global Annealing", leave=False):
+        energy_history.append(E)
         if progress_callback:
             progress_callback(step, steps)
 
@@ -459,7 +460,7 @@ def anneal_global(
         
         T *= 0.9994
         
-    return perms, pool
+    return perms, pool, energy_history
 
 # =============================
 # Storyboard (snapshots only)
@@ -548,7 +549,7 @@ def make_multi_page_storyboards_no_duplicates(
 
         root = build_full_tree(L, seed=seed + page_idx)
 
-        perm, snaps = anneal_with_snapshots(
+        perm, snaps, _ = anneal_with_snapshots(
             root=root,
             page_W=page_W,
             page_H=page_H,

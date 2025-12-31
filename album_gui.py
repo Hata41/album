@@ -14,11 +14,14 @@ from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, Q
 import sa_advanced as sa
 from PIL import Image, ImageOps
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
-    finished_optim = pyqtSignal(list)
+    finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, mode, pages_roots):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, mode, pages_roots, steps):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -30,10 +33,11 @@ class OptimizationThread(QThread):
         self.title = title
         self.mode = mode
         self.pages_roots = pages_roots
+        self.steps = steps
         
     def run(self):
         if self.mode == "global":
-            results, final_pool = sa.anneal_global(
+            results, final_pool, energy_history = sa.anneal_global(
                 roots=self.pages_roots,
                 page_W=self.page_W,
                 page_H=self.page_H,
@@ -42,14 +46,15 @@ class OptimizationThread(QThread):
                 initial_perms=self.chunks,
                 swap_pool=self.swap_pool,
                 locked_leaves=self.pages_locks,
-                steps=10000,
+                steps=self.steps,
                 progress_callback=self.emit_progress,
                 title=self.title
             )
-            self.finished_optim.emit(results)
+            self.finished_optim.emit(results, energy_history)
             return
 
         results = []
+        total_energy_history = []
         for page_idx, chunk in enumerate(self.chunks):
             current_all_images = [self.image_paths[i] for i in chunk + self.swap_pool]
             current_all_prefs = [self.all_prefs[i] for i in chunk + self.swap_pool]
@@ -63,7 +68,7 @@ class OptimizationThread(QThread):
             
             root = sa.build_full_tree(len(chunk), seed=42 + page_idx)
             
-            perm, _ = sa.anneal_with_snapshots(
+            perm, _, energy_history = sa.anneal_with_snapshots(
                 root=root,
                 page_W=self.page_W,
                 page_H=self.page_H,
@@ -71,7 +76,7 @@ class OptimizationThread(QThread):
                 all_prefs=current_all_prefs,
                 page_margin_px=50,
                 gap_px=20,
-                steps=5000,
+                steps=self.steps,
                 snapshots_count=0,
                 seed=42 + page_idx,
                 desc=f"Optimizing Page {page_idx + 1}",
@@ -79,6 +84,7 @@ class OptimizationThread(QThread):
                 progress_callback=self.emit_progress,
                 title=self.title
             )
+            total_energy_history.extend(energy_history)
             # perm is local indices, map back to global indices
             local_to_global = chunk + self.swap_pool
             global_perm = [local_to_global[local_idx] for local_idx in perm]
@@ -88,7 +94,7 @@ class OptimizationThread(QThread):
             used = set(global_perm)
             self.swap_pool = [img for img in self.swap_pool if img not in used]
         
-        self.finished_optim.emit(results)
+        self.finished_optim.emit(results, total_energy_history)
         
     def emit_progress(self, step, total):
         self.progress.emit(step, total)
@@ -258,6 +264,17 @@ class AlbumWindow(QMainWindow):
         mode_row.addWidget(self.mode_combo)
         right_layout.addLayout(mode_row)
 
+        steps_row = QHBoxLayout()
+        steps_label = QLabel("Annealing Steps")
+        self.steps_spin = QSpinBox()
+        self.steps_spin.setMinimum(1000)
+        self.steps_spin.setMaximum(100000)
+        self.steps_spin.setValue(5000)
+        self.steps_spin.setSingleStep(1000)
+        steps_row.addWidget(steps_label)
+        steps_row.addWidget(self.steps_spin)
+        right_layout.addLayout(steps_row)
+
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
         self.optimize_btn.setEnabled(False)
@@ -273,6 +290,15 @@ class AlbumWindow(QMainWindow):
         right_layout.addWidget(self.reset_btn)
         right_layout.addWidget(self.export_btn)
         right_layout.addStretch()
+
+        # Plot Placeholder
+        self.plot_container = QWidget()
+        self.plot_layout = QVBoxLayout(self.plot_container)
+        right_layout.addWidget(self.plot_container)
+        self.figure = None
+        self.canvas = None
+        self.ax = None
+
         right_layout.addWidget(self.progress_bar)
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -580,22 +606,40 @@ class AlbumWindow(QMainWindow):
         # Prepare for thread
         title = self.title_edit.text()
         mode = self.mode_combo.currentData()
+        steps = self.steps_spin.value()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, mode, self.pages_roots
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, mode, self.pages_roots, steps
         )
         self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.finished_optim.connect(self.finished_optimization)
+        self.worker.finished_optim.connect(self.on_optim_finished)
         
         self.optimize_btn.setEnabled(False)
         self.worker.start()
 
-    def finished_optimization(self, results):
+    def on_optim_finished(self, results, energy_history):
         self.pages_perms = results
         self.update_page_nav()
         self.draw_layout()
         self.optimize_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        self.update_energy_plot(energy_history)
         QMessageBox.information(self, "Done", "Optimization Complete!")
+
+    def update_energy_plot(self, history):
+        if self.canvas is None:
+            self.figure = Figure(figsize=(5, 3))
+            self.canvas = FigureCanvas(self.figure)
+            self.plot_layout.addWidget(self.canvas)
+            self.ax = self.figure.add_subplot(111)
+        else:
+            self.ax.clear()
+
+        self.ax.plot(history)
+        self.ax.set_title("Energy Curve")
+        self.ax.set_xlabel("Step")
+        self.ax.set_ylabel("Energy")
+        self.figure.tight_layout()
+        self.canvas.draw()
 
     def export_pdf_dialog(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Album as PDF", "", "PDF Files (*.pdf)")
