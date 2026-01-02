@@ -1,14 +1,16 @@
 import sys
 import os
 import random
+import json
+import copy
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QGraphicsTextItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox, QMenu)
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox, QMenu, QGroupBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, QTextDocument
 
@@ -17,6 +19,31 @@ from PIL import Image, ImageOps
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+def serialize_tree(node: Optional[sa.Node]) -> Optional[Dict]:
+    if node is None:
+        return None
+    return {
+        "dir": node.dir,
+        "t": node.t,
+        "leaf_id": node.leaf_id,
+        "locked": node.locked,
+        "left": serialize_tree(node.left),
+        "right": serialize_tree(node.right)
+    }
+
+def deserialize_tree(data: Optional[Dict]) -> Optional[sa.Node]:
+    if data is None:
+        return None
+    node = sa.Node(
+        dir=data["dir"],
+        t=data["t"],
+        leaf_id=data["leaf_id"],
+        locked=data.get("locked", False)
+    )
+    node.left = deserialize_tree(data["left"])
+    node.right = deserialize_tree(data["right"])
+    return node
 
 class ImageListEntry(QWidget):
     def __init__(self, pixmap, filename, parent=None):
@@ -54,7 +81,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode, forced_aspects):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -67,6 +94,7 @@ class OptimizationThread(QThread):
         self.pages_roots = pages_roots
         self.steps = steps
         self.mode = mode
+        self.forced_aspects = forced_aspects
         
     def run(self):
         if self.mode == "es":
@@ -81,7 +109,8 @@ class OptimizationThread(QThread):
                 locked_leaves=self.pages_locks,
                 steps=self.steps,
                 progress_callback=self.emit_progress,
-                title=self.title
+                title=self.title,
+                forced_aspects=self.forced_aspects
             )
         elif self.mode == "linear":
             new_roots, results, final_pool, energy_history = sa.optimize_linear_partition(
@@ -112,7 +141,8 @@ class OptimizationThread(QThread):
                 locked_leaves=self.pages_locks,
                 steps=self.steps,
                 progress_callback=self.emit_progress,
-                title=self.title
+                title=self.title,
+                forced_aspects=self.forced_aspects
             )
         self.finished_optim.emit(results, energy_history)
         
@@ -189,6 +219,10 @@ class LeafItem(QGraphicsRectItem):
         
         # Lock icon (simple red border or overlay for now)
         self.is_locked = False
+
+    def set_locked(self, locked: bool):
+        self.is_locked = locked
+        self.update()
         
     def contextMenuEvent(self, event):
         if self.page_idx >= len(self.parent_gui.pages_perms):
@@ -204,9 +238,16 @@ class LeafItem(QGraphicsRectItem):
         action_text = "Fit Entire Image" if is_cropped else "Crop to Fill"
         toggle_action = menu.addAction(action_text)
         
+        is_forced = img_idx in self.parent_gui.forced_aspect_ratios
+        lock_aspect_action = menu.addAction("Lock Aspect Ratio")
+        lock_aspect_action.setCheckable(True)
+        lock_aspect_action.setChecked(is_forced)
+        
         action = menu.exec(event.screenPos())
         if action == toggle_action:
             self.parent_gui.toggle_crop_state(img_idx)
+        elif action == lock_aspect_action:
+            self.parent_gui.toggle_aspect_lock(img_idx)
 
     def paint(self, painter, option, widget):
         super().paint(painter, option, widget)
@@ -234,6 +275,7 @@ class AlbumWindow(QMainWindow):
         self.current_folder: Optional[Path] = None
         self.image_metadata: List[sa.ImageMetadata] = []
         self.image_crop_states: Dict[int, bool] = {} # img_idx -> bool (True=Crop, False=Fit)
+        self.forced_aspect_ratios: Set[int] = set()
         self.show_labels = True
         self.label_bold = False
         self.label_size_ratio = 0.5
@@ -249,6 +291,8 @@ class AlbumWindow(QMainWindow):
         self.page_W = 1000  # Internal logic size
         self.page_H = 1414  # ~A4 Aspect
         
+        self.snapshots = []
+
         self.init_ui()
         
     def init_ui(self):
@@ -261,6 +305,24 @@ class AlbumWindow(QMainWindow):
         self.load_btn = QPushButton("Load Folder")
         self.load_btn.clicked.connect(self.load_images_dialog)
         left_layout.addWidget(self.load_btn)
+        
+        # History / Snapshots
+        snapshot_group = QGroupBox("History / Snapshots")
+        snapshot_layout = QVBoxLayout()
+        
+        self.take_snapshot_btn = QPushButton("Take Snapshot")
+        self.take_snapshot_btn.clicked.connect(self.take_snapshot)
+        snapshot_layout.addWidget(self.take_snapshot_btn)
+        
+        self.snapshot_combo = QComboBox()
+        snapshot_layout.addWidget(self.snapshot_combo)
+        
+        self.restore_snapshot_btn = QPushButton("Restore")
+        self.restore_snapshot_btn.clicked.connect(self.restore_snapshot)
+        snapshot_layout.addWidget(self.restore_snapshot_btn)
+        
+        snapshot_group.setLayout(snapshot_layout)
+        left_layout.addWidget(snapshot_group)
         
         select_layout = QHBoxLayout()
         self.select_all_btn = QPushButton("Select All")
@@ -284,24 +346,39 @@ class AlbumWindow(QMainWindow):
         
         # Right: Controls
         right_layout = QVBoxLayout()
-        num_pages_row = QHBoxLayout()
+
+        # Statistics Dashboard
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout()
+        self.stat_total_images = QLabel("Total Images: 0")
+        self.stat_album_capacity = QLabel("Album Capacity: 0")
+        self.stat_mandatory = QLabel("Mandatory: 0")
+        self.stat_pool = QLabel("Pool: 0")
+        stats_layout.addWidget(self.stat_total_images)
+        stats_layout.addWidget(self.stat_album_capacity)
+        stats_layout.addWidget(self.stat_mandatory)
+        stats_layout.addWidget(self.stat_pool)
+        stats_group.setLayout(stats_layout)
+        right_layout.addWidget(stats_group)
+
+        # Page Configuration
+        config_row = QHBoxLayout()
+        
         num_pages_label = QLabel("Number of Pages")
         self.num_pages_spin = QSpinBox()
         self.num_pages_spin.setMinimum(1)
         self.num_pages_spin.setValue(1)
-        self.num_pages_spin.valueChanged.connect(self.on_page_count_changed)
-        num_pages_row.addWidget(num_pages_label)
-        num_pages_row.addWidget(self.num_pages_spin)
-        right_layout.addLayout(num_pages_row)
-        
-        size_row = QHBoxLayout()
-        size_label = QLabel("Slots per Page")
-        self.slot_combo = QComboBox()
-        self.slot_combo.setEnabled(False)
-        self.slot_combo.currentIndexChanged.connect(self.on_slot_count_changed)
-        size_row.addWidget(size_label)
-        size_row.addWidget(self.slot_combo)
-        right_layout.addLayout(size_row)
+        self.num_pages_spin.valueChanged.connect(self.init_trees)
+        config_row.addWidget(num_pages_label)
+        config_row.addWidget(self.num_pages_spin)
+
+        config_label = QLabel("Slots per Page (Single number or list):")
+        self.page_config_edit = QLineEdit()
+        self.page_config_edit.setPlaceholderText("e.g. 4, 8, 4, 2")
+        self.page_config_edit.editingFinished.connect(self.on_page_config_changed)
+        config_row.addWidget(config_label)
+        config_row.addWidget(self.page_config_edit)
+        right_layout.addLayout(config_row)
         
         title_row = QHBoxLayout()
         title_label = QLabel("Page Title")
@@ -437,6 +514,76 @@ class AlbumWindow(QMainWindow):
         if folder:
             self.load_images(folder)
 
+    def take_snapshot(self):
+        if not self.current_folder:
+            return
+
+        # Deep copy mutable structures
+        # pages_perms is list of lists
+        perms_copy = copy.deepcopy(self.pages_perms)
+        # pages_locks is list of dicts
+        locks_copy = copy.deepcopy(self.pages_locks)
+        # image_crop_states is dict
+        crop_states_copy = self.image_crop_states.copy()
+        # forced_aspect_ratios is set
+        forced_aspects_copy = self.forced_aspect_ratios.copy()
+
+        snapshot = {
+            "num_pages": self.num_pages_spin.value(),
+            "page_config": self.page_config_edit.text(),
+            "title": self.title_edit.text(),
+            "trees": [serialize_tree(root) for root in self.pages_roots],
+            "perms": perms_copy,
+            "locks": locks_copy,
+            "crop_states": crop_states_copy,
+            "forced_aspects": forced_aspects_copy,
+            "settings": {
+                "image_gap": self.image_gap,
+                "show_labels": self.show_labels,
+                "label_bold": self.label_bold,
+                "label_size_ratio": self.label_size_ratio
+            }
+        }
+        
+        self.snapshots.append(snapshot)
+        self.snapshot_combo.addItem(f"Snapshot {len(self.snapshots)}")
+        self.snapshot_combo.setCurrentIndex(len(self.snapshots) - 1)
+
+    def restore_snapshot(self):
+        idx = self.snapshot_combo.currentIndex()
+        if idx < 0 or idx >= len(self.snapshots):
+            return
+            
+        data = self.snapshots[idx]
+        
+        # Restore UI values
+        self.num_pages_spin.setValue(data["num_pages"])
+        self.page_config_edit.setText(data["page_config"])
+        self.title_edit.setText(data["title"])
+        
+        # Restore Settings
+        settings = data.get("settings", {})
+        self.image_gap = settings.get("image_gap", 10)
+        self.show_labels = settings.get("show_labels", True)
+        self.label_bold = settings.get("label_bold", False)
+        self.label_size_ratio = settings.get("label_size_ratio", 0.5)
+        
+        self.gap_spin.setValue(self.image_gap)
+        self.show_labels_cb.setChecked(self.show_labels)
+        self.label_bold_cb.setChecked(self.label_bold)
+        self.label_size_spin.setValue(int(self.label_size_ratio * 100))
+
+        # Restore Data
+        self.pages_roots = [deserialize_tree(t) for t in data["trees"]]
+        self.pages_perms = copy.deepcopy(data["perms"])
+        self.pages_locks = copy.deepcopy(data["locks"])
+        self.image_crop_states = data["crop_states"].copy()
+        self.forced_aspect_ratios = data["forced_aspects"].copy()
+
+        self.current_page_idx = 0
+        self.update_stats()
+        self.draw_layout()
+
     def load_images(self, folder):
         self.image_paths = []
         self.current_folder = Path(folder)
@@ -466,7 +613,12 @@ class AlbumWindow(QMainWindow):
         self.image_metadata = sa.batch_process_images(self.image_paths)
         self.all_prefs = [m.pref_aspect for m in self.image_metadata]
         
-        self.update_slot_selector(len(self.image_paths))
+        # Default config: 1 page with power of 2 slots >= total images
+        if self.image_paths:
+            default_slots = sa.largest_power_of_two_leq(len(self.image_paths))
+            if default_slots < len(self.image_paths):
+                default_slots *= 2
+            self.page_config_edit.setText(str(default_slots))
         
         for idx, p in enumerate(self.image_paths):
             item = QListWidgetItem(self.image_list)
@@ -475,49 +627,53 @@ class AlbumWindow(QMainWindow):
             
             pix = QPixmap(str(p)).scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             widget = ImageListEntry(pix, p.name)
+            # Connect pool toggle to stats update
+            widget.pool_cb.toggled.connect(lambda: self.update_stats())
+            widget.mandatory_cb.toggled.connect(lambda: self.update_stats())
             self.image_list.setItemWidget(item, widget)
             
         self.init_trees()
+        self.update_stats()
         self.optimize_btn.setEnabled(bool(self.pages_roots))
 
-    def update_slot_selector(self, total_images: int):
-        if total_images <= 0:
-            self.slot_combo.clear()
-            self.slot_combo.setEnabled(False)
-            self.target_leaf_count = None
-            return
+    def update_stats(self):
+        total_images = len(self.image_paths)
+        
+        # Calculate album capacity
+        album_capacity = 0
+        if self.pages_roots:
+            for root in self.pages_roots:
+                album_capacity += len(sa.leaf_ids(root))
+        
+        # Calculate mandatory and pool
+        mandatory_count = 0
+        pool_count = 0
+        
+        # Include locked images as mandatory
+        locked_indices = set()
+        for p_locks in self.pages_locks:
+            for img_idx in p_locks.values():
+                locked_indices.add(img_idx)
+        
+        for i in range(self.image_list.count()):
+            item = self.image_list.item(i)
+            widget = self.image_list.itemWidget(item)
+            if isinstance(widget, ImageListEntry):
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                is_mandatory = widget.mandatory_cb.isChecked() or (idx in locked_indices)
+                is_pool = widget.pool_cb.isChecked()
+                
+                if is_mandatory:
+                    mandatory_count += 1
+                elif is_pool:
+                    pool_count += 1
+                    
+        self.stat_total_images.setText(f"Total Images: {total_images}")
+        self.stat_album_capacity.setText(f"Album Capacity: {album_capacity}")
+        self.stat_mandatory.setText(f"Mandatory: {mandatory_count}")
+        self.stat_pool.setText(f"Pool: {pool_count}")
 
-        options = []
-        k = 1
-        while k <= total_images:
-            options.append(k)
-            k *= 2
-
-        preferred = self.target_leaf_count if self.target_leaf_count in options else options[-1]
-
-        self.slot_combo.blockSignals(True)
-        self.slot_combo.clear()
-        for opt in options:
-            self.slot_combo.addItem(str(opt), opt)
-        self.slot_combo.setCurrentIndex(options.index(preferred))
-        self.slot_combo.blockSignals(False)
-        self.slot_combo.setEnabled(True)
-        self.target_leaf_count = preferred
-
-    def on_slot_count_changed(self, index: int):
-        if index < 0:
-            return
-        value = self.slot_combo.itemData(index)
-        if value is None:
-            return
-        count = int(value)
-        if count == self.target_leaf_count:
-            return
-        self.target_leaf_count = count
-        # Changing the slot count invalidates previous locks.
-        self.init_trees()
-
-    def on_page_count_changed(self, value):
+    def on_page_config_changed(self):
         self.init_trees()
 
     def init_trees(self):
@@ -526,43 +682,96 @@ class AlbumWindow(QMainWindow):
             self.optimize_btn.setEnabled(False)
             return
 
-        if (
-            self.target_leaf_count is None
-            or not sa.is_power_of_two(self.target_leaf_count)
-            or self.target_leaf_count > total_images
-        ):
-            self.target_leaf_count = sa.largest_power_of_two_leq(total_images)
-            # Sync selector to the corrected value if it exists
-            idx = self.slot_combo.findData(self.target_leaf_count)
-            if idx >= 0:
-                self.slot_combo.blockSignals(True)
-                self.slot_combo.setCurrentIndex(idx)
-                self.slot_combo.blockSignals(False)
-
-        leaf_count = self.target_leaf_count
-        max_possible_pages = max(1, total_images // leaf_count)
-        requested_pages = self.num_pages_spin.value()
-        if requested_pages > max_possible_pages:
-            self.num_pages_spin.blockSignals(True)
-            self.num_pages_spin.setValue(max_possible_pages)
-            self.num_pages_spin.blockSignals(False)
-            num_pages = max_possible_pages
-        else:
-            num_pages = requested_pages
+        config_str = self.page_config_edit.text().strip()
+        page_counts = []
+        
         try:
-            self.pages_roots = [sa.build_full_tree(leaf_count, seed=42 + i) for i in range(num_pages)]
+            if "," in config_str:
+                # List Mode: Parse comma-separated values
+                page_counts = [int(s.strip()) for s in config_str.split(",") if s.strip()]
+                # Update spinbox to match list length
+                self.num_pages_spin.blockSignals(True)
+                self.num_pages_spin.setValue(len(page_counts))
+                self.num_pages_spin.blockSignals(False)
+            else:
+                # Uniform Mode: Single value or empty
+                if config_str:
+                    slots_per_page = int(config_str)
+                else:
+                    slots_per_page = 4 # Default
+                
+                num_pages = self.num_pages_spin.value()
+                page_counts = [slots_per_page] * num_pages
+                
+            # Validate powers of two
+            for c in page_counts:
+                if not sa.is_power_of_two(c):
+                    raise ValueError(f"Invalid slot count: {c}. Must be power of 2.")
+                    
+        except ValueError as e:
+            # Fallback or error
+            print(f"Config error: {e}")
+            if not self.pages_roots: # Only if we don't have a valid state
+                 page_counts = [4]
+            else:
+                return
+
+        if not page_counts:
+             page_counts = [4]
+
+        num_pages = len(page_counts)
+        
+        try:
+            self.pages_roots = [sa.build_full_tree(count, seed=42 + i) for i, count in enumerate(page_counts)]
         except AssertionError:
             self.pages_roots = []
             self.optimize_btn.setEnabled(False)
             return
 
+        # Re-distribute pool indices
         pool_indices = list(range(total_images))
         random.shuffle(pool_indices)
-        self.pages_perms = [pool_indices[i*leaf_count:(i+1)*leaf_count] for i in range(num_pages)]
-        self.pages_locks = [{} for _ in range(num_pages)]
+        
+        self.pages_perms = []
+        current_idx = 0
+        for count in page_counts:
+            # Take 'count' images from pool if available, else fill with -1 or wrap?
+            # The original code sliced. If we run out of images, we might have issues.
+            # But the optimization loop handles perms.
+            # Let's just slice safely.
+            end_idx = min(current_idx + count, total_images)
+            page_perm = pool_indices[current_idx:end_idx]
+            # If not enough images, fill with random ones or just leave it short?
+            # The system expects perm length == leaf count usually?
+            # sa_advanced.py: energy uses perm[lid]. So perm must map leaf_id -> img_idx.
+            # If we don't have enough images, we must fill with something valid or handle it.
+            # For now, let's cycle if needed or just fill with 0.
+            while len(page_perm) < count:
+                if total_images > 0:
+                    page_perm.append(random.choice(pool_indices))
+                else:
+                    page_perm.append(0) # Should not happen if total_images > 0
+            
+            self.pages_perms.append(page_perm)
+            current_idx += count
+
+        # Reset locks if page count changed or structure changed significantly
+        # Ideally we try to preserve locks if possible, but with variable pages it's hard to map.
+        # For simplicity, if the number of pages changes, we might lose locks.
+        # But let's try to keep them if index matches.
+        if len(self.pages_locks) != num_pages:
+            self.pages_locks = [{} for _ in range(num_pages)]
+        else:
+            # Clear locks that are out of bounds for new page sizes
+            for i in range(num_pages):
+                limit = page_counts[i]
+                to_remove = [k for k in self.pages_locks[i] if k >= limit]
+                for k in to_remove:
+                    del self.pages_locks[i][k]
         
         self.current_page_idx = 0
         self.update_page_nav()
+        self.update_stats()
         self.draw_layout()
         self.optimize_btn.setEnabled(bool(self.pages_roots))
         self.export_btn.setEnabled(bool(self.pages_roots))
@@ -683,7 +892,7 @@ class AlbumWindow(QMainWindow):
                 label_item.setPos((w - gap - l_w) / 2, -l_h)
 
             if leaf_id in locked:
-                rect_item.is_locked = True
+                rect_item.set_locked(True)
                 
             self.scene.addItem(rect_item)
 
@@ -716,11 +925,23 @@ class AlbumWindow(QMainWindow):
         else:
             perm[leaf_id] = img_idx
 
+        # Automatically set crop state to False (Fit) for locked slots
+        self.image_crop_states[img_idx] = False
+
+        self.update_stats()
         self.draw_layout()
 
     def toggle_crop_state(self, img_idx):
         current = self.image_crop_states.get(img_idx, True)
         self.image_crop_states[img_idx] = not current
+        self.draw_layout()
+
+    def toggle_aspect_lock(self, img_idx):
+        if img_idx in self.forced_aspect_ratios:
+            self.forced_aspect_ratios.remove(img_idx)
+        else:
+            self.forced_aspect_ratios.add(img_idx)
+            self.image_crop_states[img_idx] = False
         self.draw_layout()
 
     def on_show_labels_toggled(self, checked):
@@ -753,12 +974,21 @@ class AlbumWindow(QMainWindow):
         if not self.pages_roots or not self.pages_perms:
             return
 
-        num_pages = self.num_pages_spin.value()
-        slots_per_page = self.target_leaf_count
-        total_needed = num_pages * slots_per_page
+        # Determine page configuration from current roots
+        page_counts = [len(sa.leaf_ids(r)) for r in self.pages_roots]
+        num_pages = len(page_counts)
+        total_needed = sum(page_counts)
+
+        # Check for existing locks to decide whether to rebuild trees
+        has_locks = False
+        for root in self.pages_roots:
+            if root and any(n.locked for n in sa.internal_nodes(root)):
+                has_locks = True
+                break
 
         # Relaunch: Regenerate trees to avoid local minima, preserving locks
-        self.pages_roots = [sa.build_full_tree(slots_per_page, seed=random.randint(0, 1000000)) for _ in range(num_pages)]
+        if not has_locks:
+            self.pages_roots = [sa.build_full_tree(count, seed=random.randint(0, 1000000)) for count in page_counts]
 
         # Step A: Identify locked indices (implicitly mandatory)
         locked_indices = set()
@@ -813,18 +1043,26 @@ class AlbumWindow(QMainWindow):
         # Distribute remaining active images into chunks
         free_active = [idx for idx in active_indices if idx not in assigned]
         for p in range(num_pages):
-            while len(chunks[p]) < slots_per_page and free_active:
+            # Use specific slot count for this page
+            slots_for_page = page_counts[p]
+            while len(chunks[p]) < slots_for_page and free_active:
                 chunks[p].append(free_active.pop(0))
 
         # Create swap pool from any remaining optional images not in active_indices
         swap_pool = optional_indices[slots_remaining:]
+
+        # Prepare forced_aspects
+        forced_aspects = {}
+        for idx in self.forced_aspect_ratios:
+            if 0 <= idx < len(self.image_metadata):
+                forced_aspects[idx] = self.image_metadata[idx].aspect_ratio
 
         # Prepare for thread
         title = self.title_edit.text()
         steps = self.steps_spin.value()
         mode = self.mode_combo.currentData()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode, forced_aspects
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)

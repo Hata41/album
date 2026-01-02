@@ -56,6 +56,7 @@ class Node:
     left: Optional["Node"] = None
     right: Optional["Node"] = None
     leaf_id: Optional[int] = None
+    locked: bool = False
 
 def is_power_of_two(x: int) -> bool:
     return x >= 1 and (x & (x - 1) == 0)
@@ -132,10 +133,11 @@ def decode_region(root: Node, x0: int, y0: int, W: int, H: int) -> Dict[int, Tup
 # =============================
 # Energy
 # =============================
-def energy(root: Node, W: int, H: int, perm: List[int], prefs: np.ndarray) -> float:
+def energy(root: Node, W: int, H: int, perm: List[int], prefs: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
     """
     prefs is a np.ndarray of target aspect ratios.
     perm[leaf_id] = image index assigned to that leaf.
+    weights is an optional np.ndarray of weights for aspect ratio penalty (aligned with prefs).
     """
     boxes = decode_region(root, 0, 0, W, H)
     num_boxes = len(boxes)
@@ -153,7 +155,13 @@ def energy(root: Node, W: int, H: int, perm: List[int], prefs: np.ndarray) -> fl
     rho = w / np.where(h == 0, 1.0, h)
     
     # Energy components
-    e_aspect = np.sum(np.log(rho / current_prefs) ** 2)
+    aspect_terms = np.log(rho / current_prefs) ** 2
+    if weights is not None:
+        current_weights = weights[img_indices]
+        e_aspect = np.sum(aspect_terms * current_weights)
+    else:
+        e_aspect = np.sum(aspect_terms)
+        
     e_area = np.sum(((w * h - target_area) / target_area) ** 2)
     
     e = e_aspect + e_area
@@ -267,13 +275,20 @@ def anneal_global(
     locked_leaves: List[Dict[int, int]], # List of leaf_id -> global_img_idx
     steps: int = 10000,
     progress_callback: Optional[callable] = None,
-    title: str = "default title"
+    title: str = "default title",
+    forced_aspects: Dict[int, float] = {}
 ) -> Tuple[List[List[int]], List[int], List[float]]:
     rng = random.Random(42)
     num_pages = len(roots)
     perms = [p[:] for p in initial_perms]
     pool = swap_pool[:]
+    
     prefs_arr = np.array(all_prefs)
+    weights_arr = np.ones(len(all_prefs))
+    for idx, ratio in forced_aspects.items():
+        if 0 <= idx < len(prefs_arr):
+            prefs_arr[idx] = ratio
+            weights_arr[idx] = 100.0
     
     # Pre-calculate internal nodes and leaf IDs for each page
     pages_internal = [internal_nodes(r) for r in roots]
@@ -292,7 +307,7 @@ def anneal_global(
     inner_H = page_H - 2 * page_margin_px - title_height
 
     # Track individual page energies
-    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr) for p in range(num_pages)]
+    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr, weights_arr) for p in range(num_pages)]
     E = sum(page_energies)
     T = 1.5
     energy_history = []
@@ -310,6 +325,9 @@ def anneal_global(
             if not pages_internal[p_idx]: continue
             n = rng.choice(pages_internal[p_idx])
             
+            if n.locked:
+                continue
+            
             old_t = n.t
             old_dir = n.dir
             
@@ -318,7 +336,7 @@ def anneal_global(
             else:
                 n.dir = "H" if old_dir == "V" else "V"
             
-            new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+            new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
             E2 = E - page_energies[p_idx] + new_page_E
             
             if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
@@ -338,7 +356,7 @@ def anneal_global(
                     i, j = rng.sample(free, 2)
                     perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
                     
-                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
                     E2 = E - page_energies[p_idx] + new_page_E
                     
                     if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
@@ -357,8 +375,8 @@ def anneal_global(
                         j = rng.choice(free2)
                         perms[p1][i], perms[p2][j] = perms[p2][j], perms[p1][i]
                         
-                        new_E1 = energy(roots[p1], inner_W, inner_H, perms[p1], prefs_arr)
-                        new_E2 = energy(roots[p2], inner_W, inner_H, perms[p2], prefs_arr)
+                        new_E1 = energy(roots[p1], inner_W, inner_H, perms[p1], prefs_arr, weights_arr)
+                        new_E2 = energy(roots[p2], inner_W, inner_H, perms[p2], prefs_arr, weights_arr)
                         E2 = E - page_energies[p1] - page_energies[p2] + new_E1 + new_E2
                         
                         if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
@@ -377,7 +395,7 @@ def anneal_global(
                         k_idx = rng.randrange(len(pool))
                         perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
                         
-                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
                         E2 = E - page_energies[p_idx] + new_page_E
                         
                         if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
@@ -399,7 +417,8 @@ def optimize_es(
     locked_leaves: List[Dict[int, int]],
     steps: int = 10000,
     progress_callback: Optional[callable] = None,
-    title: str = "default title"
+    title: str = "default title",
+    forced_aspects: Dict[int, float] = {}
 ) -> Tuple[List[List[int]], List[int], List[float]]:
     """
     (1+1)-Evolutionary Strategy for global layout optimization.
@@ -408,7 +427,13 @@ def optimize_es(
     num_pages = len(roots)
     perms = [p[:] for p in initial_perms]
     pool = swap_pool[:]
+    
     prefs_arr = np.array(all_prefs)
+    weights_arr = np.ones(len(all_prefs))
+    for idx, ratio in forced_aspects.items():
+        if 0 <= idx < len(prefs_arr):
+            prefs_arr[idx] = ratio
+            weights_arr[idx] = 100.0
     
     pages_internal = [internal_nodes(r) for r in roots]
     pages_leaf_ids = [leaf_ids(r) for r in roots]
@@ -422,7 +447,7 @@ def optimize_es(
     title_height = int(page_H * 0.1)
     inner_H = page_H - 2 * page_margin_px - title_height
 
-    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr) for p in range(num_pages)]
+    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr, weights_arr) for p in range(num_pages)]
     E = sum(page_energies)
     
     sigma = 0.1
@@ -444,27 +469,12 @@ def optimize_es(
         if move_type < 0.9: # 90% Gaussian mutation on t
             if pages_internal[p_idx]:
                 n = rng.choice(pages_internal[p_idx])
-                old_t = n.t
-                n.t = min(0.95, max(0.05, old_t + rng.gauss(0, sigma)))
                 
-                new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
-                E2 = E - page_energies[p_idx] + new_page_E
-                
-                if E2 < E:
-                    E = E2
-                    page_energies[p_idx] = new_page_E
-                    mutation_accepted = True
-                else:
-                    n.t = old_t
-        else: # 10% Discrete mutation (Flip or Swap)
-            sub_move = rng.random()
-            if sub_move < 0.33: # Flip H/V
-                if pages_internal[p_idx]:
-                    n = rng.choice(pages_internal[p_idx])
-                    old_dir = n.dir
-                    n.dir = "H" if old_dir == "V" else "V"
+                if not n.locked:
+                    old_t = n.t
+                    n.t = min(0.95, max(0.05, old_t + rng.gauss(0, sigma)))
                     
-                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
                     E2 = E - page_energies[p_idx] + new_page_E
                     
                     if E2 < E:
@@ -472,14 +482,33 @@ def optimize_es(
                         page_energies[p_idx] = new_page_E
                         mutation_accepted = True
                     else:
-                        n.dir = old_dir
+                        n.t = old_t
+        else: # 10% Discrete mutation (Flip or Swap)
+            sub_move = rng.random()
+            if sub_move < 0.33: # Flip H/V
+                if pages_internal[p_idx]:
+                    n = rng.choice(pages_internal[p_idx])
+                    
+                    if not n.locked:
+                        old_dir = n.dir
+                        n.dir = "H" if old_dir == "V" else "V"
+                        
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
+                        E2 = E - page_energies[p_idx] + new_page_E
+                        
+                        if E2 < E:
+                            E = E2
+                            page_energies[p_idx] = new_page_E
+                            mutation_accepted = True
+                        else:
+                            n.dir = old_dir
             elif sub_move < 0.66: # Intra-page swap
                 free = pages_free_slots[p_idx]
                 if len(free) >= 2:
                     i, j = rng.sample(free, 2)
                     perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
                     
-                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
                     E2 = E - page_energies[p_idx] + new_page_E
                     
                     if E2 < E:
@@ -496,7 +525,7 @@ def optimize_es(
                         k_idx = rng.randrange(len(pool))
                         perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
                         
-                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr, weights_arr)
                         E2 = E - page_energies[p_idx] + new_page_E
                         
                         if E2 < E:
