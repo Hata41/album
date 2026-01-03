@@ -81,7 +81,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode, forced_aspects):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, mode, forced_aspects, show_page_numbers):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -95,6 +95,7 @@ class OptimizationThread(QThread):
         self.steps = steps
         self.mode = mode
         self.forced_aspects = forced_aspects
+        self.show_page_numbers = show_page_numbers
         
     def run(self):
         if self.mode == "es":
@@ -110,7 +111,8 @@ class OptimizationThread(QThread):
                 steps=self.steps,
                 progress_callback=self.emit_progress,
                 title=self.title,
-                forced_aspects=self.forced_aspects
+                forced_aspects=self.forced_aspects,
+                show_page_numbers=self.show_page_numbers
             )
         elif self.mode == "linear":
             new_roots, results, final_pool, energy_history = sa.optimize_linear_partition(
@@ -124,7 +126,8 @@ class OptimizationThread(QThread):
                 locked_leaves=self.pages_locks,
                 steps=self.steps,
                 progress_callback=self.emit_progress,
-                title=self.title
+                title=self.title,
+                show_page_numbers=self.show_page_numbers
             )
             # Update roots in place
             for i in range(len(self.pages_roots)):
@@ -142,7 +145,8 @@ class OptimizationThread(QThread):
                 steps=self.steps,
                 progress_callback=self.emit_progress,
                 title=self.title,
-                forced_aspects=self.forced_aspects
+                forced_aspects=self.forced_aspects,
+                show_page_numbers=self.show_page_numbers
             )
         self.finished_optim.emit(results, energy_history)
         
@@ -153,18 +157,19 @@ class ExportThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, image_crop_states, show_labels, gap_px, label_bold, label_size_ratio):
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, page_titles, image_crop_states, show_labels, gap_px, label_bold, label_size_ratio, show_page_numbers):
         super().__init__()
         self.output_path = output_path
         self.pages_roots = pages_roots
         self.pages_perms = pages_perms
         self.image_paths = image_paths
-        self.title = title
+        self.page_titles = page_titles
         self.image_crop_states = image_crop_states
         self.show_labels = show_labels
         self.gap_px = gap_px
         self.label_bold = label_bold
         self.label_size_ratio = label_size_ratio
+        self.show_page_numbers = show_page_numbers
         self.export_W = 2480
         self.export_H = 3508
         
@@ -176,6 +181,7 @@ class ExportThread(QThread):
                 if not root or not perm:
                     continue
                 
+                title = self.page_titles[i] if i < len(self.page_titles) else "Page"
                 page_img = sa.render_page(
                     root=root,
                     page_W=self.export_W,
@@ -184,11 +190,13 @@ class ExportThread(QThread):
                     perm=perm,
                     page_margin_px=120,
                     gap_px=self.gap_px,
-                    title=self.title,
+                    title=title,
                     crop_states=self.image_crop_states,
                     show_labels=self.show_labels,
                     label_bold=self.label_bold,
-                    label_size_ratio=self.label_size_ratio
+                    label_size_ratio=self.label_size_ratio,
+                    show_page_numbers=self.show_page_numbers,
+                    page_num=i + 1
                 )
                 pdf_pages.append(page_img)
                 self.progress.emit(i + 1, total)
@@ -280,6 +288,8 @@ class AlbumWindow(QMainWindow):
         self.label_bold = False
         self.label_size_ratio = 0.5
         self.image_gap = 10
+        self.show_page_numbers = False
+        self.page_titles: List[str] = []
         self.pages_roots: List[Optional[sa.Node]] = []
         self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
         self.pages_locks: List[Dict[int, int]] = [] # Each is leaf_id -> image_idx
@@ -317,9 +327,16 @@ class AlbumWindow(QMainWindow):
         self.snapshot_combo = QComboBox()
         snapshot_layout.addWidget(self.snapshot_combo)
         
+        snapshot_btns = QHBoxLayout()
         self.restore_snapshot_btn = QPushButton("Restore")
         self.restore_snapshot_btn.clicked.connect(self.restore_snapshot)
-        snapshot_layout.addWidget(self.restore_snapshot_btn)
+        snapshot_btns.addWidget(self.restore_snapshot_btn)
+        
+        self.delete_snapshot_btn = QPushButton("Delete")
+        self.delete_snapshot_btn.clicked.connect(self.delete_snapshot)
+        snapshot_btns.addWidget(self.delete_snapshot_btn)
+        
+        snapshot_layout.addLayout(snapshot_btns)
         
         snapshot_group.setLayout(snapshot_layout)
         left_layout.addWidget(snapshot_group)
@@ -384,8 +401,14 @@ class AlbumWindow(QMainWindow):
         title_label = QLabel("Page Title")
         self.title_edit = QLineEdit()
         self.title_edit.setText("default title")
+        self.title_edit.returnPressed.connect(self.on_title_return_pressed)
+        
+        self.apply_all_title_btn = QPushButton("Apply to All")
+        self.apply_all_title_btn.clicked.connect(self.apply_title_to_all)
+        
         title_row.addWidget(title_label)
         title_row.addWidget(self.title_edit)
+        title_row.addWidget(self.apply_all_title_btn)
         right_layout.addLayout(title_row)
 
         mode_row = QHBoxLayout()
@@ -415,6 +438,10 @@ class AlbumWindow(QMainWindow):
         self.show_labels_cb.setChecked(self.show_labels)
         self.show_labels_cb.toggled.connect(self.on_show_labels_toggled)
         
+        self.show_page_numbers_cb = QCheckBox("Page Numbers")
+        self.show_page_numbers_cb.setChecked(self.show_page_numbers)
+        self.show_page_numbers_cb.toggled.connect(self.on_show_page_numbers_toggled)
+
         self.label_bold_cb = QCheckBox("Bold")
         self.label_bold_cb.setChecked(self.label_bold)
         self.label_bold_cb.toggled.connect(self.on_label_bold_toggled)
@@ -432,6 +459,7 @@ class AlbumWindow(QMainWindow):
         self.gap_spin.valueChanged.connect(self.on_gap_changed)
         
         label_gap_row.addWidget(self.show_labels_cb)
+        label_gap_row.addWidget(self.show_page_numbers_cb)
         label_gap_row.addWidget(self.label_bold_cb)
         label_gap_row.addStretch()
         label_gap_row.addWidget(label_size_label)
@@ -519,19 +547,16 @@ class AlbumWindow(QMainWindow):
             return
 
         # Deep copy mutable structures
-        # pages_perms is list of lists
         perms_copy = copy.deepcopy(self.pages_perms)
-        # pages_locks is list of dicts
         locks_copy = copy.deepcopy(self.pages_locks)
-        # image_crop_states is dict
         crop_states_copy = self.image_crop_states.copy()
-        # forced_aspect_ratios is set
-        forced_aspects_copy = self.forced_aspect_ratios.copy()
+        # Convert set to list for JSON serialization
+        forced_aspects_copy = list(self.forced_aspect_ratios)
 
-        snapshot = {
+        snapshot_data = {
             "num_pages": self.num_pages_spin.value(),
             "page_config": self.page_config_edit.text(),
-            "title": self.title_edit.text(),
+            "page_titles": self.page_titles,
             "trees": [serialize_tree(root) for root in self.pages_roots],
             "perms": perms_copy,
             "locks": locks_copy,
@@ -541,25 +566,57 @@ class AlbumWindow(QMainWindow):
                 "image_gap": self.image_gap,
                 "show_labels": self.show_labels,
                 "label_bold": self.label_bold,
-                "label_size_ratio": self.label_size_ratio
+                "label_size_ratio": self.label_size_ratio,
+                "show_page_numbers": self.show_page_numbers
             }
         }
         
-        self.snapshots.append(snapshot)
-        self.snapshot_combo.addItem(f"Snapshot {len(self.snapshots)}")
-        self.snapshot_combo.setCurrentIndex(len(self.snapshots) - 1)
+        # Find a unique filename
+        base_name = self.current_folder.name
+        i = 1
+        while True:
+            snapshot_path = self.current_folder / f"{base_name}_snapshot_{i}.json"
+            if not snapshot_path.exists():
+                break
+            i += 1
+            
+        try:
+            with open(snapshot_path, "w") as f:
+                json.dump(snapshot_data, f, indent=4)
+            
+            self.snapshots.append({"path": snapshot_path, "data": snapshot_data})
+            self.snapshot_combo.addItem(snapshot_path.name)
+            self.snapshot_combo.setCurrentIndex(len(self.snapshots) - 1)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save snapshot: {e}")
+
+    def delete_snapshot(self):
+        idx = self.snapshot_combo.currentIndex()
+        if idx < 0 or idx >= len(self.snapshots):
+            return
+            
+        snapshot = self.snapshots[idx]
+        path = snapshot["path"]
+        
+        try:
+            if path.exists():
+                path.unlink()
+            
+            self.snapshots.pop(idx)
+            self.snapshot_combo.removeItem(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to delete snapshot: {e}")
 
     def restore_snapshot(self):
         idx = self.snapshot_combo.currentIndex()
         if idx < 0 or idx >= len(self.snapshots):
             return
             
-        data = self.snapshots[idx]
+        data = self.snapshots[idx]["data"]
         
         # Restore UI values
         self.num_pages_spin.setValue(data["num_pages"])
         self.page_config_edit.setText(data["page_config"])
-        self.title_edit.setText(data["title"])
         
         # Restore Settings
         settings = data.get("settings", {})
@@ -567,26 +624,32 @@ class AlbumWindow(QMainWindow):
         self.show_labels = settings.get("show_labels", True)
         self.label_bold = settings.get("label_bold", False)
         self.label_size_ratio = settings.get("label_size_ratio", 0.5)
+        self.show_page_numbers = settings.get("show_page_numbers", False)
         
         self.gap_spin.setValue(self.image_gap)
         self.show_labels_cb.setChecked(self.show_labels)
         self.label_bold_cb.setChecked(self.label_bold)
         self.label_size_spin.setValue(int(self.label_size_ratio * 100))
+        self.show_page_numbers_cb.setChecked(self.show_page_numbers)
 
         # Restore Data
+        self.page_titles = data.get("page_titles", [data.get("title", "default title")] * data["num_pages"])
         self.pages_roots = [deserialize_tree(t) for t in data["trees"]]
         self.pages_perms = copy.deepcopy(data["perms"])
-        self.pages_locks = copy.deepcopy(data["locks"])
-        self.image_crop_states = data["crop_states"].copy()
-        self.forced_aspect_ratios = data["forced_aspects"].copy()
+        self.pages_locks = [{int(k): v for k, v in d.items()} for d in data["locks"]]
+        self.image_crop_states = {int(k): v for k, v in data["crop_states"].items()}
+        # Convert list back to set
+        self.forced_aspect_ratios = set(data["forced_aspects"])
 
         self.current_page_idx = 0
+        self.update_page_nav()
         self.update_stats()
         self.draw_layout()
 
     def load_images(self, folder):
         self.image_paths = []
         self.current_folder = Path(folder)
+        self.page_titles = []
         self.image_metadata = []
         self.all_prefs = []
         self.pages_roots = []
@@ -597,7 +660,7 @@ class AlbumWindow(QMainWindow):
         
         folder_path = Path(folder)
         exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-        files = sorted([p for p in folder_path.rglob("*") if p.suffix.lower() in exts])
+        files = sorted([p for p in folder_path.glob("*") if p.suffix.lower() in exts])
         
         if not files:
             self.slot_combo.clear()
@@ -613,6 +676,19 @@ class AlbumWindow(QMainWindow):
         self.image_metadata = sa.batch_process_images(self.image_paths)
         self.all_prefs = [m.pref_aspect for m in self.image_metadata]
         
+        # Load existing snapshots
+        self.snapshots = []
+        self.snapshot_combo.clear()
+        snapshot_files = sorted(list(self.current_folder.glob(f"{self.current_folder.name}_snapshot_*.json")))
+        for p in snapshot_files:
+            try:
+                with open(p, "r") as f:
+                    data = json.load(f)
+                self.snapshots.append({"path": p, "data": data})
+                self.snapshot_combo.addItem(p.name)
+            except Exception as e:
+                print(f"Error loading snapshot {p}: {e}")
+
         # Default config: 1 page with power of 2 slots >= total images
         if self.image_paths:
             default_slots = sa.largest_power_of_two_leq(len(self.image_paths))
@@ -721,6 +797,27 @@ class AlbumWindow(QMainWindow):
 
         num_pages = len(page_counts)
         
+        # Update page titles
+        old_titles = self.page_titles
+        self.page_titles = []
+        default_title = self.current_folder.name if self.current_folder else "Page"
+        for i in range(num_pages):
+            if i < len(old_titles):
+                self.page_titles.append(old_titles[i])
+            else:
+                self.page_titles.append(f"{default_title} {i+1}")
+        
+        # Update title edit if current page changed or initialized
+        if self.current_page_idx >= num_pages:
+            self.current_page_idx = num_pages - 1
+        if self.current_page_idx < 0:
+            self.current_page_idx = 0
+            
+        if self.page_titles:
+            self.title_edit.blockSignals(True)
+            self.title_edit.setText(self.page_titles[self.current_page_idx])
+            self.title_edit.blockSignals(False)
+
         try:
             self.pages_roots = [sa.build_full_tree(count, seed=42 + i) for i, count in enumerate(page_counts)]
         except AssertionError:
@@ -817,8 +914,9 @@ class AlbumWindow(QMainWindow):
         margin = 20
         W, H = self.page_W, self.page_H
         title_height = int(H * 0.1)
+        footer_height = int(H * 0.05) if self.show_page_numbers else 0
         in_W = W - 2*margin
-        in_H = H - 2*margin - title_height
+        in_H = H - 2*margin - title_height - footer_height
         
         # Draw page background
         bg_rect = QGraphicsRectItem(x_offset, y_offset, W, H)
@@ -829,7 +927,7 @@ class AlbumWindow(QMainWindow):
         boxes = sa.decode_region(root, margin, margin + title_height, in_W, in_H)
         
         # Draw title
-        title_text = self.title_edit.text()
+        title_text = self.page_titles[page_idx] if page_idx < len(self.page_titles) else "Page"
         text_item = QGraphicsTextItem()
         text_document = QTextDocument()
         text_document.setHtml(f"<div style='text-align: center;'>{title_text}</div>")
@@ -841,6 +939,21 @@ class AlbumWindow(QMainWindow):
         text_item.setFont(font)
         text_item.setDefaultTextColor(QColor(0, 0, 0))
         self.scene.addItem(text_item)
+
+        # Draw page number
+        if self.show_page_numbers:
+            page_num_text = str(page_idx + 1)
+            num_item = QGraphicsTextItem()
+            num_doc = QTextDocument()
+            num_doc.setHtml(f"<div style='text-align: center;'>{page_num_text}</div>")
+            num_item.setDocument(num_doc)
+            num_item.setPos(x_offset + margin, y_offset + H - margin - footer_height)
+            num_item.setTextWidth(W - 2*margin)
+            n_font = num_item.font()
+            n_font.setPixelSize(int(footer_height * 0.5))
+            num_item.setFont(n_font)
+            num_item.setDefaultTextColor(QColor(0, 0, 0))
+            self.scene.addItem(num_item)
         
         gap = self.image_gap
         
@@ -927,6 +1040,7 @@ class AlbumWindow(QMainWindow):
 
         # Automatically set crop state to False (Fit) for locked slots
         self.image_crop_states[img_idx] = False
+        self.forced_aspect_ratios.add(img_idx)
 
         self.update_stats()
         self.draw_layout()
@@ -1062,7 +1176,7 @@ class AlbumWindow(QMainWindow):
         steps = self.steps_spin.value()
         mode = self.mode_combo.currentData()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode, forced_aspects
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps, mode, forced_aspects, self.show_page_numbers
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)
@@ -1098,8 +1212,7 @@ class AlbumWindow(QMainWindow):
         if not self.current_folder:
             return
             
-        pdf_dir = Path("pdfs")
-        pdf_dir.mkdir(exist_ok=True)
+        pdf_dir = self.current_folder
         
         base_name = self.current_folder.name
         i = 1
@@ -1113,10 +1226,10 @@ class AlbumWindow(QMainWindow):
         self.optimize_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         
-        title = self.title_edit.text()
         self.export_worker = ExportThread(
-            str(path), self.pages_roots, self.pages_perms, self.image_paths, title, 
-            self.image_crop_states, self.show_labels, self.image_gap, self.label_bold, self.label_size_ratio
+            str(path), self.pages_roots, self.pages_perms, self.image_paths, self.page_titles, 
+            self.image_crop_states, self.show_labels, self.image_gap, self.label_bold, self.label_size_ratio,
+            self.show_page_numbers
         )
         self.export_worker.progress.connect(self.progress_bar.setValue)
         self.export_worker.finished.connect(self.on_export_finished)
@@ -1169,6 +1282,27 @@ class AlbumWindow(QMainWindow):
             self.page_label.setText(f"Page {self.current_page_idx + 1} / {num_pages}")
             self.prev_btn.setEnabled(self.current_page_idx > 0)
             self.next_btn.setEnabled(self.current_page_idx < num_pages - 1)
+            
+            # Update title edit for current page
+            if 0 <= self.current_page_idx < len(self.page_titles):
+                self.title_edit.blockSignals(True)
+                self.title_edit.setText(self.page_titles[self.current_page_idx])
+                self.title_edit.blockSignals(False)
+
+    def on_title_return_pressed(self):
+        if 0 <= self.current_page_idx < len(self.page_titles):
+            self.page_titles[self.current_page_idx] = self.title_edit.text()
+            self.draw_layout()
+
+    def apply_title_to_all(self):
+        text = self.title_edit.text()
+        for i in range(len(self.page_titles)):
+            self.page_titles[i] = text
+        self.draw_layout()
+
+    def on_show_page_numbers_toggled(self, checked):
+        self.show_page_numbers = checked
+        self.draw_layout()
 
     def select_all_images(self):
         for i in range(self.image_list.count()):

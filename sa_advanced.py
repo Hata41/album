@@ -190,10 +190,13 @@ def render_page(
     show_labels: bool = False,
     label_bold: bool = False,
     label_size_ratio: float = 0.5,
+    show_page_numbers: bool = False,
+    page_num: int = 1,
 ) -> Image.Image:
     title_height = int(page_H * 0.1)
+    footer_height = int(page_H * 0.05) if show_page_numbers else 0
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px - title_height
+    inner_H = page_H - 2 * page_margin_px - title_height - footer_height
     if inner_W <= 0 or inner_H <= 0:
         raise ValueError("page_margin_px too large for the page size")
 
@@ -220,6 +223,24 @@ def render_page(
     x = (page_W - text_width) // 2
     y = (title_height - text_height) // 2
     draw.text((x, y), title, fill=(0, 0, 0), font=font)
+
+    # Draw page number
+    if show_page_numbers:
+        try:
+            footer_font = ImageFont.truetype("arial.ttf", int(footer_height * 0.5))
+        except:
+            try:
+                footer_font = ImageFont.truetype("DejaVuSans.ttf", int(footer_height * 0.5))
+            except:
+                footer_font = ImageFont.load_default()
+        
+        page_str = str(page_num)
+        f_bbox = draw.textbbox((0, 0), page_str, font=footer_font)
+        f_w = f_bbox[2] - f_bbox[0]
+        f_h = f_bbox[3] - f_bbox[1]
+        fx = (page_W - f_w) // 2
+        fy = page_H - page_margin_px - (footer_height + f_h) // 2
+        draw.text((fx, fy), page_str, fill=(0, 0, 0), font=footer_font)
 
     # Label font setup
     label_font_size = max(8, int(gap_px * label_size_ratio))
@@ -276,7 +297,8 @@ def anneal_global(
     steps: int = 10000,
     progress_callback: Optional[callable] = None,
     title: str = "default title",
-    forced_aspects: Dict[int, float] = {}
+    forced_aspects: Dict[int, float] = {},
+    show_page_numbers: bool = False
 ) -> Tuple[List[List[int]], List[int], List[float]]:
     rng = random.Random(42)
     num_pages = len(roots)
@@ -304,7 +326,8 @@ def anneal_global(
     page_margin_px = 50 
     inner_W = page_W - 2 * page_margin_px
     title_height = int(page_H * 0.1)
-    inner_H = page_H - 2 * page_margin_px - title_height
+    footer_height = int(page_H * 0.05) if show_page_numbers else 0
+    inner_H = page_H - 2 * page_margin_px - title_height - footer_height
 
     # Track individual page energies
     page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr, weights_arr) for p in range(num_pages)]
@@ -418,7 +441,8 @@ def optimize_es(
     steps: int = 10000,
     progress_callback: Optional[callable] = None,
     title: str = "default title",
-    forced_aspects: Dict[int, float] = {}
+    forced_aspects: Dict[int, float] = {},
+    show_page_numbers: bool = False
 ) -> Tuple[List[List[int]], List[int], List[float]]:
     """
     (1+1)-Evolutionary Strategy for global layout optimization.
@@ -445,7 +469,8 @@ def optimize_es(
     page_margin_px = 50 
     inner_W = page_W - 2 * page_margin_px
     title_height = int(page_H * 0.1)
-    inner_H = page_H - 2 * page_margin_px - title_height
+    footer_height = int(page_H * 0.05) if show_page_numbers else 0
+    inner_H = page_H - 2 * page_margin_px - title_height - footer_height
 
     page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr, weights_arr) for p in range(num_pages)]
     E = sum(page_energies)
@@ -555,7 +580,8 @@ def optimize_linear_partition(
     locked_leaves: List[Dict[int, int]],
     steps: int = 1,
     progress_callback: Optional[callable] = None,
-    title: str = "default title"
+    title: str = "default title",
+    show_page_numbers: bool = False
 ) -> Tuple[List[Node], List[List[int]], List[int], List[float]]:
     """
     Deterministic Linear Partitioning (Justified Layout) algorithm.
@@ -568,8 +594,9 @@ def optimize_linear_partition(
     
     page_margin_px = 50 
     title_height = int(page_H * 0.1)
+    footer_height = int(page_H * 0.05) if show_page_numbers else 0
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px - title_height
+    inner_H = page_H - 2 * page_margin_px - title_height - footer_height
 
     for p_idx in range(num_pages):
         perm = perms[p_idx]
