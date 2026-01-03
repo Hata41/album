@@ -403,11 +403,15 @@ class AlbumWindow(QMainWindow):
         self.title_edit.setText("default title")
         self.title_edit.returnPressed.connect(self.on_title_return_pressed)
         
+        self.copy_prev_title_btn = QPushButton("Copy Prev")
+        self.copy_prev_title_btn.clicked.connect(self.copy_previous_title)
+        
         self.apply_all_title_btn = QPushButton("Apply to All")
         self.apply_all_title_btn.clicked.connect(self.apply_title_to_all)
         
         title_row.addWidget(title_label)
         title_row.addWidget(self.title_edit)
+        title_row.addWidget(self.copy_prev_title_btn)
         title_row.addWidget(self.apply_all_title_btn)
         right_layout.addLayout(title_row)
 
@@ -797,6 +801,15 @@ class AlbumWindow(QMainWindow):
 
         num_pages = len(page_counts)
         
+        # Preserve Existing State
+        old_roots = self.pages_roots
+        old_perms = self.pages_perms
+        old_locks = self.pages_locks
+        
+        self.pages_roots = []
+        self.pages_perms = []
+        self.pages_locks = []
+
         # Update page titles
         old_titles = self.page_titles
         self.page_titles = []
@@ -818,53 +831,57 @@ class AlbumWindow(QMainWindow):
             self.title_edit.setText(self.page_titles[self.current_page_idx])
             self.title_edit.blockSignals(False)
 
-        try:
-            self.pages_roots = [sa.build_full_tree(count, seed=42 + i) for i, count in enumerate(page_counts)]
-        except AssertionError:
-            self.pages_roots = []
-            self.optimize_btn.setEnabled(False)
-            return
-
-        # Re-distribute pool indices
-        pool_indices = list(range(total_images))
-        random.shuffle(pool_indices)
-        
-        self.pages_perms = []
-        current_idx = 0
-        for count in page_counts:
-            # Take 'count' images from pool if available, else fill with -1 or wrap?
-            # The original code sliced. If we run out of images, we might have issues.
-            # But the optimization loop handles perms.
-            # Let's just slice safely.
-            end_idx = min(current_idx + count, total_images)
-            page_perm = pool_indices[current_idx:end_idx]
-            # If not enough images, fill with random ones or just leave it short?
-            # The system expects perm length == leaf count usually?
-            # sa_advanced.py: energy uses perm[lid]. So perm must map leaf_id -> img_idx.
-            # If we don't have enough images, we must fill with something valid or handle it.
-            # For now, let's cycle if needed or just fill with 0.
-            while len(page_perm) < count:
-                if total_images > 0:
-                    page_perm.append(random.choice(pool_indices))
-                else:
-                    page_perm.append(0) # Should not happen if total_images > 0
+        # Smart Regeneration
+        for i in range(num_pages):
+            count = page_counts[i]
+            preserved = False
+            if i < len(old_roots) and old_roots[i] is not None:
+                old_count = len(sa.leaf_ids(old_roots[i]))
+                if old_count == count:
+                    self.pages_roots.append(old_roots[i])
+                    self.pages_perms.append(old_perms[i])
+                    self.pages_locks.append(old_locks[i])
+                    preserved = True
             
-            self.pages_perms.append(page_perm)
-            current_idx += count
+            if not preserved:
+                try:
+                    self.pages_roots.append(sa.build_full_tree(count, seed=42 + i))
+                    self.pages_perms.append([-1] * count)
+                    self.pages_locks.append({})
+                except AssertionError:
+                    pass
 
-        # Reset locks if page count changed or structure changed significantly
-        # Ideally we try to preserve locks if possible, but with variable pages it's hard to map.
-        # For simplicity, if the number of pages changes, we might lose locks.
-        # But let's try to keep them if index matches.
-        if len(self.pages_locks) != num_pages:
-            self.pages_locks = [{} for _ in range(num_pages)]
-        else:
-            # Clear locks that are out of bounds for new page sizes
-            for i in range(num_pages):
-                limit = page_counts[i]
-                to_remove = [k for k in self.pages_locks[i] if k >= limit]
-                for k in to_remove:
-                    del self.pages_locks[i][k]
+        # Identify all images already assigned to preserved pages
+        assigned_indices = set()
+        for perm in self.pages_perms:
+            for img_idx in perm:
+                if img_idx != -1:
+                    assigned_indices.add(img_idx)
+
+        # Re-distribute images for non-preserved slots
+        available_indices = [idx for idx in range(total_images) if idx not in assigned_indices]
+        random.shuffle(available_indices)
+        
+        for i in range(num_pages):
+            perm = self.pages_perms[i]
+            for j in range(len(perm)):
+                if perm[j] == -1:
+                    if available_indices:
+                        img_idx = available_indices.pop(0)
+                        perm[j] = img_idx
+                        assigned_indices.add(img_idx)
+                    else:
+                        # Fallback if we run out of images
+                        if total_images > 0:
+                            perm[j] = random.choice(range(total_images))
+                        else:
+                            perm[j] = 0
+
+        self.update_page_nav()
+        self.update_stats()
+        self.draw_layout()
+        self.optimize_btn.setEnabled(bool(self.pages_roots))
+        self.export_btn.setEnabled(bool(self.pages_roots))
         
         self.current_page_idx = 0
         self.update_page_nav()
@@ -1093,15 +1110,19 @@ class AlbumWindow(QMainWindow):
         num_pages = len(page_counts)
         total_needed = sum(page_counts)
 
-        # Check for existing locks to decide whether to rebuild trees
-        has_locks = False
+        # Check for existing locks (internal nodes)
+        has_internal_locks = False
         for root in self.pages_roots:
             if root and any(n.locked for n in sa.internal_nodes(root)):
-                has_locks = True
+                has_internal_locks = True
                 break
+        
+        # Check for image locks (leaf locks)
+        has_image_locks = any(len(locks) > 0 for locks in self.pages_locks)
 
         # Relaunch: Regenerate trees to avoid local minima, preserving locks
-        if not has_locks:
+        # If we have image locks, we should probably NOT regenerate trees because leaf_ids would change.
+        if not has_internal_locks and not has_image_locks:
             self.pages_roots = [sa.build_full_tree(count, seed=random.randint(0, 1000000)) for count in page_counts]
 
         # Step A: Identify locked indices (implicitly mandatory)
@@ -1144,23 +1165,28 @@ class AlbumWindow(QMainWindow):
             active_indices.extend(optional_indices[:slots_remaining])
 
         # Initialize buckets
-        chunks = [[] for _ in range(num_pages)]
+        chunks = [[-1] * count for count in page_counts]
         assigned = set()
 
-        # Identify and assign locked images to their specific pages
+        # 1. Identify and assign locked images to their specific pages and leaf_ids
         for p in range(num_pages):
             for leaf_id, img_idx in self.pages_locks[p].items():
                 if img_idx in active_indices:
-                    chunks[p].append(img_idx)
-                    assigned.add(img_idx)
+                    # Ensure leaf_id is within bounds for the current tree
+                    if leaf_id < len(chunks[p]):
+                        chunks[p][leaf_id] = img_idx
+                        assigned.add(img_idx)
 
-        # Distribute remaining active images into chunks
+        # 2. Distribute remaining active images into chunks
         free_active = [idx for idx in active_indices if idx not in assigned]
         for p in range(num_pages):
-            # Use specific slot count for this page
-            slots_for_page = page_counts[p]
-            while len(chunks[p]) < slots_for_page and free_active:
-                chunks[p].append(free_active.pop(0))
+            for leaf_id in range(len(chunks[p])):
+                if chunks[p][leaf_id] == -1:
+                    if free_active:
+                        chunks[p][leaf_id] = free_active.pop(0)
+                    else:
+                        # Should not happen if total_needed is correct
+                        chunks[p][leaf_id] = 0
 
         # Create swap pool from any remaining optional images not in active_indices
         swap_pool = optional_indices[slots_remaining:]
@@ -1292,6 +1318,13 @@ class AlbumWindow(QMainWindow):
     def on_title_return_pressed(self):
         if 0 <= self.current_page_idx < len(self.page_titles):
             self.page_titles[self.current_page_idx] = self.title_edit.text()
+            self.draw_layout()
+
+    def copy_previous_title(self):
+        if self.current_page_idx > 0:
+            prev_title = self.page_titles[self.current_page_idx - 1]
+            self.page_titles[self.current_page_idx] = prev_title
+            self.title_edit.setText(prev_title)
             self.draw_layout()
 
     def apply_title_to_all(self):
