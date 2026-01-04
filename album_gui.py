@@ -371,10 +371,12 @@ class AlbumWindow(QMainWindow):
         self.stat_album_capacity = QLabel("Album Capacity: 0")
         self.stat_mandatory = QLabel("Mandatory: 0")
         self.stat_pool = QLabel("Pool: 0")
+        self.stat_suggestion = QLabel("Suggestion: -")
         stats_layout.addWidget(self.stat_total_images)
         stats_layout.addWidget(self.stat_album_capacity)
         stats_layout.addWidget(self.stat_mandatory)
         stats_layout.addWidget(self.stat_pool)
+        stats_layout.addWidget(self.stat_suggestion)
         stats_group.setLayout(stats_layout)
         right_layout.addWidget(stats_group)
 
@@ -693,11 +695,19 @@ class AlbumWindow(QMainWindow):
             except Exception as e:
                 print(f"Error loading snapshot {p}: {e}")
 
-        # Default config: 1 page with power of 2 slots >= total images
+        # Default config: 1 page with power of 2 slots >= total images, capped at 4
         if self.image_paths:
-            default_slots = sa.largest_power_of_two_leq(len(self.image_paths))
-            if default_slots < len(self.image_paths):
-                default_slots *= 2
+            self.num_pages_spin.blockSignals(True)
+            self.num_pages_spin.setValue(1)
+            self.num_pages_spin.blockSignals(False)
+            
+            n = len(self.image_paths)
+            if n >= 3:
+                default_slots = 4
+            elif n == 2:
+                default_slots = 2
+            else:
+                default_slots = 1
             self.page_config_edit.setText(str(default_slots))
         
         for idx, p in enumerate(self.image_paths):
@@ -752,6 +762,19 @@ class AlbumWindow(QMainWindow):
         self.stat_album_capacity.setText(f"Album Capacity: {album_capacity}")
         self.stat_mandatory.setText(f"Mandatory: {mandatory_count}")
         self.stat_pool.setText(f"Pool: {pool_count}")
+        
+        # Binary decomposition suggestion
+        n = total_images
+        powers = []
+        p = 1
+        temp_n = n
+        while temp_n > 0:
+            if temp_n % 2 == 1:
+                powers.append(p)
+            temp_n //= 2
+            p *= 2
+        suggestion = ", ".join(map(str, sorted(powers, reverse=True)))
+        self.stat_suggestion.setText(f"Suggestion: {suggestion if suggestion else '-'}")
 
     def on_page_config_changed(self):
         self.init_trees()
@@ -775,12 +798,21 @@ class AlbumWindow(QMainWindow):
                 self.num_pages_spin.blockSignals(False)
             else:
                 # Uniform Mode: Single value or empty
+                num_pages = self.num_pages_spin.value()
                 if config_str:
                     slots_per_page = int(config_str)
                 else:
-                    slots_per_page = 4 # Default
+                    # New Behavior: Calculate slots dynamically based on n and m
+                    n = total_images
+                    m = num_pages
+                    target = n // m if m > 0 else 4
+                    
+                    # Map to closest valid power of two (1, 2, 4, 8), capped at 8
+                    if target >= 6: slots_per_page = 8
+                    elif target >= 3: slots_per_page = 4
+                    elif target >= 2: slots_per_page = 2
+                    else: slots_per_page = 1
                 
-                num_pages = self.num_pages_spin.value()
                 page_counts = [slots_per_page] * num_pages
                 
             # Validate powers of two
