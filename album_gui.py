@@ -151,7 +151,13 @@ class OptimizationThread(QThread):
         self.finished_optim.emit(results, energy_history)
         
     def emit_progress(self, step, total):
-        self.progress.emit(step, total)
+        # Throttle signals: emit only every 1% or at the end
+        if total > 0:
+            chunk = max(1, total // 100)
+            if step % chunk == 0 or step >= total:
+                self.progress.emit(step, total)
+        else:
+            self.progress.emit(step, total)
 
 class ExportThread(QThread):
     progress = pyqtSignal(int, int)
@@ -282,6 +288,7 @@ class AlbumWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.current_folder: Optional[Path] = None
         self.image_metadata: List[sa.ImageMetadata] = []
+        self.pixmap_cache: Dict[int, QPixmap] = {} # Cache for thumbnails
         self.image_crop_states: Dict[int, bool] = {} # img_idx -> bool (True=Crop, False=Fit)
         self.forced_aspect_ratios: Set[int] = set()
         self.show_labels = True
@@ -682,6 +689,14 @@ class AlbumWindow(QMainWindow):
         self.image_metadata = sa.batch_process_images(self.image_paths)
         self.all_prefs = [m.pref_aspect for m in self.image_metadata]
         
+        # Pre-load thumbnails into cache
+        self.pixmap_cache = {}
+        for idx, p in enumerate(self.image_paths):
+            pix = QPixmap(str(p))
+            if not pix.isNull():
+                # Scale to reasonable thumbnail size (e.g. 800x800) to save RAM
+                self.pixmap_cache[idx] = pix.scaled(800, 800, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        
         # Load existing snapshots
         self.snapshots = []
         self.snapshot_combo.clear()
@@ -1022,7 +1037,11 @@ class AlbumWindow(QMainWindow):
             
             # Load image to display in rect
             path = self.image_paths[img_idx]
-            pix = QPixmap(str(path))
+            # Use cached pixmap if available, otherwise load from disk (fallback)
+            pix = self.pixmap_cache.get(img_idx)
+            if pix is None:
+                pix = QPixmap(str(path))
+                
             if not pix.isNull():
                  should_crop = self.image_crop_states.get(img_idx, True)
                  if should_crop:
