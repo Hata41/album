@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QGraphicsTextItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox, QMenu, QGroupBox)
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox, QMenu, QGroupBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, QTextDocument
 
@@ -164,7 +164,7 @@ class ExportThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, output_path, pages_roots, pages_perms, image_paths, page_titles, image_crop_states, show_labels, gap_px, label_bold, label_size_ratio, show_page_numbers):
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, page_titles, image_crop_states, show_labels, gap_px, label_bold, label_size_ratio, show_page_numbers, page_W, page_H):
         super().__init__()
         self.output_path = output_path
         self.pages_roots = pages_roots
@@ -177,8 +177,21 @@ class ExportThread(QThread):
         self.label_bold = label_bold
         self.label_size_ratio = label_size_ratio
         self.show_page_numbers = show_page_numbers
-        self.export_W = 2480
-        self.export_H = 3508
+        
+        # Calculate export dimensions based on aspect ratio
+        # Default base size for max dimension (e.g. A4 @ 300dpi is ~3508 px)
+        max_dim = 3508
+        if page_W > 0 and page_H > 0:
+            ratio = page_W / page_H
+            if ratio > 1:
+                self.export_W = max_dim
+                self.export_H = int(max_dim / ratio)
+            else:
+                self.export_H = max_dim
+                self.export_W = int(max_dim * ratio)
+        else:
+            self.export_W = 2480
+            self.export_H = 3508
         
     def run(self):
         try:
@@ -408,6 +421,41 @@ class AlbumWindow(QMainWindow):
         config_row.addWidget(config_label)
         config_row.addWidget(self.page_config_edit)
         right_layout.addLayout(config_row)
+
+        # Aspect Ratio Configuration
+        aspect_row = QHBoxLayout()
+        aspect_label = QLabel("Page Aspect Ratio")
+        self.aspect_combo = QComboBox()
+        self.aspect_combo.addItem("A4 Portrait (1:1.414)", (1.0, 1.414))
+        self.aspect_combo.addItem("A4 Landscape (1.414:1)", (1.414, 1.0))
+        self.aspect_combo.addItem("Square (1:1)", (1.0, 1.0))
+        self.aspect_combo.addItem("16:9", (16.0, 9.0))
+        self.aspect_combo.addItem("4:3", (4.0, 3.0))
+        self.aspect_combo.addItem("Custom...", None)
+        self.aspect_combo.currentIndexChanged.connect(self.on_aspect_ratio_changed)
+
+        self.custom_w_spin = QDoubleSpinBox()
+        self.custom_h_spin = QDoubleSpinBox()
+        self.custom_w_spin.setRange(0.1, 10000.0)
+        self.custom_h_spin.setRange(0.1, 10000.0)
+        self.custom_w_spin.setSingleStep(0.1)
+        self.custom_h_spin.setSingleStep(0.1)
+        self.custom_w_spin.setDecimals(3)
+        self.custom_h_spin.setDecimals(3)
+        self.custom_w_spin.setValue(1.0)
+        self.custom_h_spin.setValue(1.414)
+        self.custom_w_spin.setEnabled(False)
+        self.custom_h_spin.setEnabled(False)
+        self.custom_w_spin.valueChanged.connect(self.on_custom_ratio_changed)
+        self.custom_h_spin.valueChanged.connect(self.on_custom_ratio_changed)
+
+        aspect_row.addWidget(aspect_label)
+        aspect_row.addWidget(self.aspect_combo)
+        aspect_row.addWidget(QLabel("W:"))
+        aspect_row.addWidget(self.custom_w_spin)
+        aspect_row.addWidget(QLabel("H:"))
+        aspect_row.addWidget(self.custom_h_spin)
+        right_layout.addLayout(aspect_row)
         
         title_row = QHBoxLayout()
         title_label = QLabel("Page Title")
@@ -553,6 +601,43 @@ class AlbumWindow(QMainWindow):
         bottom_layout.addWidget(self.grid_view_btn)
         main_layout.addLayout(bottom_layout)
 
+    def on_aspect_ratio_changed(self, index):
+        data = self.aspect_combo.itemData(index)
+        is_custom = (data is None)
+        
+        self.custom_w_spin.setEnabled(is_custom)
+        self.custom_h_spin.setEnabled(is_custom)
+        
+        if not is_custom:
+            w, h = data
+            self.custom_w_spin.blockSignals(True)
+            self.custom_h_spin.blockSignals(True)
+            self.custom_w_spin.setValue(w)
+            self.custom_h_spin.setValue(h)
+            self.custom_w_spin.blockSignals(False)
+            self.custom_h_spin.blockSignals(False)
+            self.update_internal_dimensions(w, h)
+
+    def on_custom_ratio_changed(self):
+        w = self.custom_w_spin.value()
+        h = self.custom_h_spin.value()
+        self.update_internal_dimensions(w, h)
+
+    def update_internal_dimensions(self, w_ratio, h_ratio):
+        # Scale logic: maintain max dimension around 1414
+        target_max = 1414
+        
+        if w_ratio < 0.1 or h_ratio < 0.1:
+            return
+
+        current_max = max(w_ratio, h_ratio)
+        scale = target_max / current_max
+        
+        self.page_W = int(w_ratio * scale)
+        self.page_H = int(h_ratio * scale)
+        
+        self.draw_layout()
+
     def load_images_dialog(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
         if folder:
@@ -583,7 +668,12 @@ class AlbumWindow(QMainWindow):
                 "show_labels": self.show_labels,
                 "label_bold": self.label_bold,
                 "label_size_ratio": self.label_size_ratio,
-                "show_page_numbers": self.show_page_numbers
+                "show_page_numbers": self.show_page_numbers,
+                "aspect_ratio": {
+                    "index": self.aspect_combo.currentIndex(),
+                    "custom_w": self.custom_w_spin.value(),
+                    "custom_h": self.custom_h_spin.value()
+                }
             }
         }
         
@@ -641,6 +731,28 @@ class AlbumWindow(QMainWindow):
         self.label_bold = settings.get("label_bold", False)
         self.label_size_ratio = settings.get("label_size_ratio", 0.5)
         self.show_page_numbers = settings.get("show_page_numbers", False)
+        
+        ar_data = settings.get("aspect_ratio", {})
+        if ar_data:
+            idx = ar_data.get("index", 0)
+            custom_w = ar_data.get("custom_w", 1.0)
+            custom_h = ar_data.get("custom_h", 1.414)
+            
+            if 0 <= idx < self.aspect_combo.count():
+                self.aspect_combo.setCurrentIndex(idx)
+                
+            # If custom (assuming Custom is the last item or specific logic)
+            # Safe way: set spinboxes anyway
+            self.custom_w_spin.blockSignals(True)
+            self.custom_h_spin.blockSignals(True)
+            self.custom_w_spin.setValue(float(custom_w))
+            self.custom_h_spin.setValue(float(custom_h))
+            self.custom_w_spin.blockSignals(False)
+            self.custom_h_spin.blockSignals(False)
+            
+            # Explicitly trigger update if it was custom
+            if self.aspect_combo.itemData(idx) is None:
+                 self.update_internal_dimensions(custom_w, custom_h)
         
         self.gap_spin.setValue(self.image_gap)
         self.show_labels_cb.setChecked(self.show_labels)
@@ -1327,7 +1439,7 @@ class AlbumWindow(QMainWindow):
         self.export_worker = ExportThread(
             str(path), self.pages_roots, self.pages_perms, self.image_paths, self.page_titles, 
             self.image_crop_states, self.show_labels, self.image_gap, self.label_bold, self.label_size_ratio,
-            self.show_page_numbers
+            self.show_page_numbers, self.page_W, self.page_H
         )
         self.export_worker.progress.connect(self.progress_bar.setValue)
         self.export_worker.finished.connect(self.on_export_finished)
