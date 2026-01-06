@@ -3,6 +3,7 @@ import os
 import random
 import json
 import copy
+import math
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 
@@ -394,14 +395,16 @@ class AlbumWindow(QMainWindow):
         self.num_pages_spin = QSpinBox()
         self.num_pages_spin.setMinimum(1)
         self.num_pages_spin.setValue(1)
-        self.num_pages_spin.valueChanged.connect(self.init_trees)
+        self.num_pages_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.num_pages_spin.setKeyboardTracking(False)
+        self.num_pages_spin.lineEdit().returnPressed.connect(self.on_num_pages_enter)
         config_row.addWidget(num_pages_label)
         config_row.addWidget(self.num_pages_spin)
 
         config_label = QLabel("Slots per Page (Single number or list):")
         self.page_config_edit = QLineEdit()
         self.page_config_edit.setPlaceholderText("e.g. 4, 8, 4, 2")
-        self.page_config_edit.editingFinished.connect(self.on_page_config_changed)
+        self.page_config_edit.returnPressed.connect(self.on_page_config_changed)
         config_row.addWidget(config_label)
         config_row.addWidget(self.page_config_edit)
         right_layout.addLayout(config_row)
@@ -542,12 +545,12 @@ class AlbumWindow(QMainWindow):
         self.grid_view_btn.setCheckable(True)
         self.grid_view_btn.clicked.connect(self.toggle_view_mode)
         
-        bottom_layout.addWidget(self.prev_btn)
         bottom_layout.addStretch()
         bottom_layout.addWidget(self.page_label)
-        bottom_layout.addStretch()
-        bottom_layout.addWidget(self.grid_view_btn)
+        bottom_layout.addSpacing(20)
+        bottom_layout.addWidget(self.prev_btn)
         bottom_layout.addWidget(self.next_btn)
+        bottom_layout.addWidget(self.grid_view_btn)
         main_layout.addLayout(bottom_layout)
 
     def load_images_dialog(self):
@@ -791,10 +794,27 @@ class AlbumWindow(QMainWindow):
         suggestion = ", ".join(map(str, sorted(powers, reverse=True)))
         self.stat_suggestion.setText(f"Suggestion: {suggestion if suggestion else '-'}")
 
+    def on_num_pages_enter(self):
+        self.num_pages_spin.interpretText()
+        config_str = self.page_config_edit.text().strip()
+        if "," in config_str:
+            # Sync list length with spinbox
+            new_num = self.num_pages_spin.value()
+            parts = [s.strip() for s in config_str.split(",") if s.strip()]
+            if len(parts) != new_num:
+                if len(parts) > new_num:
+                    parts = parts[:new_num]
+                else:
+                    last_val = parts[-1] if parts else "4"
+                    parts.extend([last_val] * (new_num - len(parts)))
+                self.page_config_edit.setText(", ".join(parts))
+        self.init_trees()
+
     def on_page_config_changed(self):
         self.init_trees()
 
     def init_trees(self):
+        self.num_pages_spin.interpretText()
         total_images = len(self.image_paths)
         if total_images == 0:
             self.optimize_btn.setEnabled(False)
@@ -948,9 +968,10 @@ class AlbumWindow(QMainWindow):
             self.render_page_to_scene(self.current_page_idx, 0, 0)
         else:
             # Grid View
-            cols = 3
+            num_pages = len(self.pages_roots)
+            cols = math.ceil(math.sqrt(num_pages)) if num_pages > 0 else 1
             visual_gap = 100
-            for i in range(len(self.pages_roots)):
+            for i in range(num_pages):
                 row = i // cols
                 col = i % cols
                 x_offset = col * (self.page_W + visual_gap)
